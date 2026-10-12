@@ -1,0 +1,13 @@
+# نفس نسخ بيئة التدريب الناجحة (مثبّتة عشان مفيش مفاجآت في الـbuild)
+transformers==4.47.1
+peft==0.14.0
+bitsandbytes==0.50.2
+accelerate==1.2.1
+sentencepiece
+protobuf
+runpod>=1.7.0
+# للمرحلة الجاية (DOCX) - مؤجلة لكنها خفيفة
+python-docx>=1.1.2
+requests>=2.32.0
+hf_transfer
+json-repair>=0.30.0
