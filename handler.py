@@ -73,8 +73,12 @@ def resolve_lora_path() -> str:
     if config.LORA_PATH and os.path.exists(os.path.join(config.LORA_PATH, "adapter_config.json")):
         return config.LORA_PATH
     print("Downloading LoRA from Hugging Face:", config.LORA_REPO)
+    tok = (os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or "").strip().strip("\"'").strip()
+    repo = (config.LORA_REPO or "").strip().strip("\"'")
+    # تشخيص بدون كشف التوكن: الطول وأول 3 حروف فقط
+    print(f"HF_TOKEN present={bool(tok)} len={len(tok)} prefix={tok[:3]!r} repo={repo!r}")
     return snapshot_download(
-        repo_id=config.LORA_REPO, token=os.getenv("HF_TOKEN") or None,
+        repo_id=repo, token=tok or None,
         allow_patterns=["adapter_model.safetensors", "adapter_config.json", "system_prompt.txt"],
         cache_dir=os.getenv("LORA_CACHE_DIR", "/tmp/lora_cache"))
 
