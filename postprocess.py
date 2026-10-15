@@ -158,17 +158,28 @@ def clean_program(p, chunk_text_n, review):
     return out
 
 
+def _compatible(p, q):
+    """نفس البرنامج لو الأرقام متطابقة أو واحد منهم فاضي (مش لو الأرقام مختلفة: ده صف تاني لجهة تانية)."""
+    for k in ("beneficiaries_count", "budget"):
+        a, b = p.get(k), q.get(k)
+        if a not in (None, "") and b not in (None, "") and a != b:
+            return False
+    return True
+
+
 def merge_programs(lists, thr=0.9):
-    """نفس الاسم (تشابه >= thr) = عنصر واحد، والحقول الفاضية بتتملى من النسخة التانية (مفيد مع تداخل الصفحات)."""
-    merged = []
-    for lst in lists:
+    """دمج التكرار الناتج عن تداخل الصفحات بين الأجزاء فقط.
+    - ما بندمجش صفوف من نفس الجزء أبدا (نفس الاسم ممكن يتكرر لجهات مختلفة، زي السلال الرمضانية).
+    - بندمج صف مع صف من جزء سابق بس لو الاسم متشابه >= thr والأرقام متطابقة/ناقصة."""
+    merged = []          # (chunk_index, program)
+    for ci, lst in enumerate(lists):
         for p in lst:
-            for q in merged:
-                if name_score(p.get("name"), q.get("name")) >= thr:
+            for qi, q in merged:
+                if qi < ci and name_score(p.get("name"), q.get("name")) >= thr and _compatible(p, q):
                     for k, v in p.items():
                         if q.get(k) in (None, "") and v not in (None, ""):
                             q[k] = v
                     break
             else:
-                merged.append(dict(p))
-    return merged
+                merged.append((ci, dict(p)))
+    return [q for _, q in merged]

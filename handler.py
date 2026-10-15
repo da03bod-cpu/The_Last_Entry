@@ -162,6 +162,8 @@ def extract_document(job_input: dict) -> dict:
         return v
 
     assoc = pick("association_name", "اسم الجمعية")
+    if isinstance(assoc, str):
+        assoc = re.sub(r"\s*التقرير\s*(السنوي)?\s*\d{0,4}\s*$", "", assoc).strip()
     year = pick("year", "سنة التقرير")
     period = pick("period", "الفترة")
     if isinstance(year, str) and year.strip().isdigit():
