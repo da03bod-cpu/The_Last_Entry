@@ -1,0 +1,108 @@
+{
+  "name": "Athar NGO Program Autofill — RunPod Serverless Integration",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "program-autofill",
+        "responseMode": "lastNode",
+        "options": {
+          "binaryPropertyName": "files"
+        }
+      },
+      "id": "webhook-autofill",
+      "name": "Webhook (Respond When Last Node Finishes)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse backend multipart/form-data payload according to AI_PROGRAM_AUTOFILL_N8N_CONTRACT\nconst item = $input.first();\nconst body = item.json.body || item.json || {};\nconst runId = String(body.run_id || '');\nconst runType = String(body.type || 'program_autofill');\n\nlet parsedInput = {};\nif (typeof body.input === 'string' && body.input.trim()) {\n  try {\n    parsedInput = JSON.parse(body.input);\n  } catch (err) {\n    throw new Error(`Invalid JSON in 'input' field: ${err.message}`);\n  }\n} else if (typeof body.input === 'object' && body.input !== null) {\n  parsedInput = body.input;\n}\n\nconst pastedText = typeof parsedInput.text === 'string' ? parsedInput.text : '';\nconst orderedFilenames = Array.isArray(parsedInput.files) ? parsedInput.files : [];\n\n// Collect binary attachments in positional order matching input.files[i]\nconst binaryObj = item.binary || {};\nconst binaryKeys = Object.keys(binaryObj).sort();\nconst filesPayload = [];\n\nfor (let i = 0; i < binaryKeys.length; i++) {\n  const key = binaryKeys[i];\n  const bin = binaryObj[key];\n  if (!bin || !bin.data) continue;\n  const positionalName = orderedFilenames[i] || bin.fileName || `attachment_${i + 1}`;\n  filesPayload.push({\n    filename: positionalName,\n    mime_type: bin.mimeType || 'application/octet-stream',\n    content_base64: bin.data\n  });\n}\n\nreturn [{\n  json: {\n    runpod_payload: {\n      input: {\n        run_id: runId,\n        type: runType,\n        input: JSON.stringify({ text: pastedText, files: orderedFilenames }),\n        text: pastedText,\n        files: filesPayload\n      }\n    }\n  }\n}];"
+      },
+      "id": "code-parse-multipart",
+      "name": "Parse Contract & Align Positional Binaries",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.runpod.ai/v2/' + $env.RUNPOD_ENDPOINT_ID + '/runsync' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $env.RUNPOD_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.runpod_payload) }}",
+        "options": {
+          "timeout": 55000
+        }
+      },
+      "id": "http-runpod-runsync",
+      "name": "RunPod Serverless (/runsync)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [760, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Transform RunPod output and enforce 2xx JSON object contract or throw HTTP error\nconst resp = $input.first().json;\n\nif (resp.status === 'FAILED' || (resp.output && resp.output.error)) {\n  const errMsg = (resp.output && resp.output.error) || resp.error || 'RunPod execution failed';\n  throw new Error(`Extraction failed: ${errMsg}`);\n}\n\nconst out = resp.output || resp;\nif (!out || typeof out !== 'object' || Array.isArray(out)) {\n  throw new Error('RunPod did not return a valid JSON object');\n}\n\nreturn [{ json: out }];"
+      },
+      "id": "code-transform-response",
+      "name": "Validate & Return Final Contract JSON Object",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 300]
+    }
+  ],
+  "connections": {
+    "Webhook (Respond When Last Node Finishes)": {
+      "main": [
+        [
+          {
+            "node": "Parse Contract & Align Positional Binaries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Contract & Align Positional Binaries": {
+      "main": [
+        [
+          {
+            "node": "RunPod Serverless (/runsync)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RunPod Serverless (/runsync)": {
+      "main": [
+        [
+          {
+            "node": "Validate & Return Final Contract JSON Object",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
