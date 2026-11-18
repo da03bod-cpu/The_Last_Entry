@@ -1,4 +1,4 @@
-# نفس نسخ بيئة التدريب الناجحة (مثبّتة عشان مفيش مفاجآت في الـbuild)
+# Core inference dependencies (pinned to match fine-tuned LoRA v3 training environment)
 transformers==4.47.1
 peft==0.14.0
 bitsandbytes==0.50.2
@@ -6,8 +6,13 @@ accelerate==1.2.1
 sentencepiece
 protobuf
 runpod>=1.7.0
-# للمرحلة الجاية (DOCX) - مؤجلة لكنها خفيفة
-python-docx>=1.1.2
 requests>=2.32.0
 hf_transfer
 json-repair>=0.30.0
+
+# Document ingestion dependencies (PDF, OCR, Excel, Word)
+pymupdf>=1.24.0
+openpyxl>=3.1.2
+python-docx>=1.1.2
+Pillow>=10.0.0
+pytesseract>=0.3.10
