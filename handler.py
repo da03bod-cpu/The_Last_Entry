@@ -1,24 +1,15 @@
 """
-RunPod Serverless handler - استخراج برامج/مشاريع الجمعيات (Mistral Small 24B 4-bit + LoRA v3)
+RunPod Serverless handler - extracting NGO programs/projects.
+Mistral Small 24B 4-bit + LoRA v3.
 
-الطلب (job["input"]):
-  {
-    "text": "===== PAGE 1 =====\n...نص OCR للتقرير كامل...",
-    "association_name": "جمعية البر بمكة المكرمة",   # من n8n (موصى به: الموديل بيعتمد عليه)
-    "year": 2025,                                      # اختياري
-    "period": null                                     # اختياري: null = تقرير سنوي
-  }
-
-الناتج:
-  {"result": {"association_name","year","period","programs_and_projects":[...]},
-   "review": [{"name","reason"}], "chunks": [...], "json_repaired": bool}
-
-الخطوات: تقسيم لأجزاء (10000 حرف، تداخل صفحة) -> كتلة METADATA لكل جزء -> توليد -> تأريض الأرقام -> دمج بين الأجزاء.
-الهيدر (الاسم/السنة/الفترة) بيتحط من الطلب في الكود، مش من الموديل (الفترة كانت 0% دقة).
+Whole-document length has no application-level cap: document pages are split
+into ~10,000-char chunks with page overlap and, only if necessary, further
+split to fit a SINGLE inference call's token budget. The model's finite
+context window and RunPod payload/execution limits still apply.
 """
 import sys
 
-sys.modules["torchvision"] = None   # الموديل نصي؛ يمنع تعارض torchvision مع torch 2.8 (لازم قبل transformers)
+sys.modules["torchvision"] = None  # Must come before transformers.
 
 import json
 import os
@@ -52,7 +43,7 @@ def resolve_base_path(model_id: str) -> str:
         versions = sorted(d for d in os.listdir(snaps) if os.path.isdir(os.path.join(snaps, d)))
         if versions:
             return os.path.join(snaps, versions[0])
-    print("WARNING: الموديل مش في كاش Runpod - هيتحمّل من HF (أبطأ؛ محتاج Container Disk 80GB+).")
+    print("WARNING: Base model not found in RunPod cache - downloading from Hugging Face.")
     return model_id
 
 
@@ -75,7 +66,6 @@ def resolve_lora_path() -> str:
     print("Downloading LoRA from Hugging Face:", config.LORA_REPO)
     tok = (os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or "").strip().strip("\"'").strip()
     repo = (config.LORA_REPO or "").strip().strip("\"'")
-    # تشخيص بدون كشف التوكن: الطول وأول 3 حروف فقط
     print(f"HF_TOKEN present={bool(tok)} len={len(tok)} prefix={tok[:3]!r} repo={repo!r}")
     return snapshot_download(
         repo_id=repo, token=tok or None,
@@ -87,19 +77,109 @@ lora_path = resolve_lora_path()
 model = PeftModel.from_pretrained(base_model, lora_path)
 model.eval()
 
-# الـsystem prompt اللي اتدرّب بيه الموديل بيتحفظ جنب الـadapter؛ لو موجود هو المرجع.
 SYSTEM_PROMPT = config.SYSTEM_PROMPT
 _sp = os.path.join(lora_path, "system_prompt.txt")
 if os.path.isfile(_sp):
     saved = open(_sp, encoding="utf-8").read().strip()
     if saved and saved != config.SYSTEM_PROMPT.strip():
-        print("NOTE: system_prompt.txt في الـadapter مختلف عن config.py - هنستخدم اللي في الـadapter (ده اللي اتدرّب بيه).")
+        print("NOTE: adapter system_prompt.txt overrides config.py to match training.")
         SYSTEM_PROMPT = saved
 print("Model ready.")
 
 
+def _model_context_tokens():
+    """Find physical context capacity; ignore tokenizer sentinel 'infinite' values."""
+    cfg = getattr(model, "config", None)
+    text_cfg = getattr(cfg, "text_config", None)
+    candidates = [
+        getattr(cfg, "max_position_embeddings", None),
+        getattr(text_cfg, "max_position_embeddings", None),
+        getattr(tokenizer, "model_max_length", None),
+    ]
+    valid = [int(n) for n in candidates if isinstance(n, int) and 1024 <= n < 10_000_000]
+    return min(valid) if valid else None
+
+
+def _per_chunk_token_budget():
+    """A safety budget for ONE inference, not a limit on document length.
+
+    Retain the former MAX_INPUT_TOKENS + 600 ceiling for similar inference
+    behavior on the trained model; never exceed its physical context once
+    the expected generated output and safety margin are included.
+    """
+    budget = int(config.MAX_INPUT_TOKENS) + 600
+    context = _model_context_tokens()
+    if context is not None:
+        budget = min(budget, context - int(config.MAX_NEW_TOKENS) - 128)
+    if budget < 256:
+        raise ValueError(
+            "No usable prompt budget: check MAX_INPUT_TOKENS, MAX_NEW_TOKENS and model context window"
+        )
+    return budget
+
+
+PROMPT_TOKEN_BUDGET = _per_chunk_token_budget()
+print("Per-inference input token budget:", PROMPT_TOKEN_BUDGET)
+
+
+def _format_prompt(user_text: str):
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_text}]
+    return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+
+
+def _count_input_tokens(user_text: str) -> int:
+    """Count the SAME complete prompt passed to generate_once: system + metadata + pages."""
+    prompt = _format_prompt(user_text)
+    return len(tokenizer(prompt, add_special_tokens=True)["input_ids"])
+
+
+def _split_page_in_half(text: str):
+    """Split a single too-token-heavy page near the middle; small context overlap."""
+    if len(text) < 2:
+        raise ValueError("Cannot split input further: metadata/system prompt exceeds token budget")
+    middle = len(text) // 2
+    # Prefer a natural separator close to the middle; always make progress.
+    lo = max(1, middle - min(350, middle // 3))
+    hi = min(len(text) - 1, middle + min(350, middle // 3))
+    boundaries = [text.rfind("\n\n", lo, hi), text.rfind("\n", lo, hi), text.rfind(" ", lo, hi)]
+    cut = next((p for p in boundaries if p > 0), middle)
+    overlap = min(180, len(text) // 20)
+    left = text[:min(len(text) - 1, cut + overlap)].strip()
+    right = text[max(1, cut - overlap):].strip()
+    if not left or not right or left == text or right == text:
+        left, right = text[:middle], text[middle:]
+    return left, right
+
+
+def _split_chunk_to_token_budget(chunk_pages, meta_block, budget):
+    """Only split *after* normal page chunking if complete prompt is oversized.
+
+    Normal documents keep their original chunk boundaries and training format.
+    Each returned subchunk is a list of (page_number, body) tuples.
+    """
+    pending = [chunk_pages]
+    ready = []
+    while pending:
+        ch = pending.pop()
+        if _count_input_tokens(meta_block + pp.render(ch)) <= budget:
+            ready.append(ch)
+            continue
+
+        if len(ch) > 1:
+            mid = len(ch) // 2
+            a, b = ch[:mid], ch[mid:]
+        else:
+            page_no, page_text = ch[0]
+            a_text, b_text = _split_page_in_half(page_text)
+            a, b = [(page_no, a_text)], [(page_no, b_text)]
+
+        # Stack order is reversed so output remains in the document's order.
+        pending.extend([b, a])
+    return ready
+
+
 class RepeatLoopStop(StoppingCriteria):
-    """يوقف التوليد لو آخر `window` توكن بيكرروا نمط قصير (حلقة تكرار)."""
+    """Stop generation on repeated short token sequences."""
 
     def __init__(self, prompt_len, window=96, max_period=12, check_every=16):
         self.prompt_len, self.window, self.max_period, self.check_every = prompt_len, window, max_period, check_every
@@ -120,12 +200,14 @@ class RepeatLoopStop(StoppingCriteria):
 
 
 def generate_once(user_text: str, rp: float):
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_text}]
-    prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    prompt = _format_prompt(user_text)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     n_in = int(inputs["input_ids"].shape[1])
-    if n_in > config.MAX_INPUT_TOKENS + 600:
-        return "", 0, n_in, "input_too_long"
+    # Internal assertion: caller must pre-split; never silently drop chunks.
+    if n_in > PROMPT_TOKEN_BUDGET:
+        raise ValueError(
+            f"Internal chunking error: {n_in} tokens > {PROMPT_TOKEN_BUDGET} token budget"
+        )
     stopper = RepeatLoopStop(n_in)
     with torch.no_grad():
         out = model.generate(**inputs, max_new_tokens=config.MAX_NEW_TOKENS, do_sample=False,
@@ -170,17 +252,24 @@ def extract_document(job_input: dict) -> dict:
         year = int(year.strip())
 
     pages = pp.split_pages(text)
-    chunks = pp.build_chunks(pages, config.CHUNK_TARGET_CHARS, config.CHUNK_OVERLAP_PAGES)
+    original_chunks = pp.build_chunks(pages, config.CHUNK_TARGET_CHARS, config.CHUNK_OVERLAP_PAGES)
     meta_block = pp.build_meta_block(assoc, year, period)
 
+    # Preflight is CPU-side and ensures no input_too_long empty output is created.
+    chunks = []
+    for original_index, ch in enumerate(original_chunks, 1):
+        for fitted in _split_chunk_to_token_budget(ch, meta_block, PROMPT_TOKEN_BUDGET):
+            chunks.append((original_index, fitted))
+
     per_chunk_lists, review, info, repaired_any = [], [], [], False
-    for k, ch in enumerate(chunks, 1):
+    for k, (original_index, ch) in enumerate(chunks, 1):
         body = pp.render(ch)
         t0 = time.time()
         raw, gi = run_chunk(meta_block + body)
         obj, repaired = pp.parse_json_output(raw)
         repaired_any = repaired_any or repaired
-        gi.update({"chunk": k, "pages": [ch[0][0], ch[-1][0]], "seconds": round(time.time() - t0, 1)})
+        gi.update({"chunk": k, "source_chunk": original_index,
+                   "pages": [ch[0][0], ch[-1][0]], "seconds": round(time.time() - t0, 1)})
         progs = []
         if isinstance(obj, dict) and isinstance(obj.get("programs_and_projects"), list):
             tn = pp.norm(body)

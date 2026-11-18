@@ -1,8 +1,12 @@
 """
-postprocess.py - منطق بدون GPU (بيتجرّب offline): تقسيم المستند لأجزاء بنفس طريقة التدريب، كتلة METADATA،
-قراءة ناتج الموديل، تأريض الأرقام، الدمج بين الأجزاء، وعلامات المراجعة.
-مهم: الأرقام (10000 حرف، تداخل صفحة، صيغة METADATA) لازم تفضل مطابقة لبيانات التدريب.
+postprocess.py - Offline document splitting, model output parsing,
+number grounding, de-duplication and review flags.
+
+The original 10,000-character target, PAGE markers, page overlap and
+METADATA format are retained for regular documents. Oversized pages and
+texts without PAGE markers are split into smaller virtual pages.
 """
+
 import html
 import json
 import re
@@ -11,13 +15,14 @@ from difflib import SequenceMatcher
 PAGE_RE = re.compile(r"^===== PAGE (\d+) =====\s*$", re.MULTILINE)
 META_START = "===== METADATA ====="
 META_END = "===== END METADATA ====="
-FIELDS = ["type", "name", "year", "description", "beneficiaries_count", "budget",
-          "beneficiary_value", "target_audience", "delivery_method", "notes"]
+FIELDS = [
+    "type", "name", "year", "description", "beneficiaries_count", "budget",
+    "beneficiary_value", "target_audience", "delivery_method", "notes",
+]
 
 AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
 AR_DIAC = re.compile("[ً-ٰٟـ]")
 GENERIC = {"برنامج", "مشروع", "مبادره", "فعاليه", "حمله", "دوره", "ملتقي", "ملتقى"}
-# أسماء شكلها فعاليات خارجية/مشاركات: بتتعلّم "للمراجعة" بس ولا بتتحذف (الداتا فيها حالات حقيقية بنفس الشكل)
 EVENT_RE = re.compile(r"^(?:ال)?(ملتقى|منتدى|معرض|مهرجان|مؤتمر|المشاركة|مشاركة|نشر|اليوم العالمي|يوم)")
 
 
@@ -55,9 +60,9 @@ def number_in_text(value, text_n) -> bool:
     return digits in flat or digits in text_n.replace(" ", "")
 
 
-# ---------------- التقسيم (نفس prepare_chunks.py) ----------------
+# ---------------- Chunking (same defaults as prepare_chunks.py) ----------------
 def strip_metadata(text: str):
-    """لو النص جاي فيه كتلة METADATA في أوله، بنشيلها ونرجّع قيمها (الطلب بيتفوق عليها)."""
+    """Strip a preexisting METADATA block; explicit request fields take precedence."""
     if META_START not in text:
         return text, {}
     m = re.search(re.escape(META_START) + r"(.*?)" + re.escape(META_END), text, re.DOTALL)
@@ -82,15 +87,64 @@ def split_pages(text: str):
     return pages
 
 
+def _split_oversized_page(text: str, target_chars: int, overlap_chars: int = 250):
+    """Make virtual pages only when a single page exceeds the target size.
+
+    Prefer paragraph/line/space boundaries, and retain a small overlap so
+    a program mentioned at a break is less likely to lose its context.
+    """
+    if len(text) <= target_chars:
+        return [text]
+    pieces = []
+    start = 0
+    safe_overlap = min(overlap_chars, max(0, target_chars // 10))
+    while start < len(text):
+        hard_end = min(start + target_chars, len(text))
+        end = hard_end
+        if hard_end < len(text):
+            lower = start + max(1, int(target_chars * 0.7))
+            candidates = [
+                text.rfind("\n\n", lower, hard_end),
+                text.rfind("\n", lower, hard_end),
+                text.rfind(" ", lower, hard_end),
+            ]
+            found = next((p for p in candidates if p > start), -1)
+            if found != -1:
+                end = found
+        part = text[start:end].strip()
+        if part:
+            pieces.append(part)
+        if end >= len(text):
+            break
+        start = max(start + 1, end - safe_overlap)
+    return pieces
+
+
 def build_chunks(pages, target_chars: int, overlap_pages: int):
+    """Preserve regular page-aware splitting; split only oversized pages first.
+
+    The target is per chunk, NOT a maximum total document length. The one
+    oversized physical page can now create multiple virtual pages carrying
+    the same original page number, preserving the PAGE marker format.
+    """
+    if target_chars <= 0:
+        raise ValueError("CHUNK_TARGET_CHARS must be greater than zero")
+    if overlap_pages < 0:
+        raise ValueError("CHUNK_OVERLAP_PAGES must not be negative")
+
+    expanded_pages = []
+    for page_number, page_text in pages:
+        for part in _split_oversized_page(page_text, target_chars):
+            expanded_pages.append((page_number, part))
+
     chunks = []
-    i, n = 0, len(pages)
+    i, n = 0, len(expanded_pages)
     while i < n:
         j, size = i, 0
-        while j < n and (j == i or size + len(pages[j][1]) <= target_chars):
-            size += len(pages[j][1])
+        while j < n and (j == i or size + len(expanded_pages[j][1]) <= target_chars):
+            size += len(expanded_pages[j][1])
             j += 1
-        chunks.append(pages[i:j])
+        chunks.append(expanded_pages[i:j])
         if j >= n:
             break
         i = max(j - overlap_pages, i + 1)
@@ -106,7 +160,7 @@ def build_meta_block(name, year, period) -> str:
             f"الفترة: {period or 'تقرير سنوي'}\n{META_END}\n\n")
 
 
-# ---------------- قراءة الناتج ----------------
+# ---------------- Parse model output ----------------
 def parse_json_output(s: str):
     s = (s or "").strip()
     try:
@@ -142,7 +196,7 @@ def to_number(v):
 
 
 def clean_program(p, chunk_text_n, review):
-    """بيوحّد شكل البرنامج (10 حقول)، description=null، والأرقام لازم تكون مكتوبة في نص الجزء وإلا null."""
+    """Normalize ten fields, null description, ground two numeric fields."""
     if not isinstance(p, dict) or not str(p.get("name") or "").strip():
         return None
     out = {k: p.get(k) for k in FIELDS}
@@ -159,7 +213,6 @@ def clean_program(p, chunk_text_n, review):
 
 
 def _compatible(p, q):
-    """نفس البرنامج لو الأرقام متطابقة أو واحد منهم فاضي (مش لو الأرقام مختلفة: ده صف تاني لجهة تانية)."""
     for k in ("beneficiaries_count", "budget"):
         a, b = p.get(k), q.get(k)
         if a not in (None, "") and b not in (None, "") and a != b:
@@ -168,10 +221,8 @@ def _compatible(p, q):
 
 
 def merge_programs(lists, thr=0.9):
-    """دمج التكرار الناتج عن تداخل الصفحات بين الأجزاء فقط.
-    - ما بندمجش صفوف من نفس الجزء أبدا (نفس الاسم ممكن يتكرر لجهات مختلفة، زي السلال الرمضانية).
-    - بندمج صف مع صف من جزء سابق بس لو الاسم متشابه >= thr والأرقام متطابقة/ناقصة."""
-    merged = []          # (chunk_index, program)
+    """Merge between chunks only, if names and numeric fields are compatible."""
+    merged = []
     for ci, lst in enumerate(lists):
         for p in lst:
             for qi, q in merged:
