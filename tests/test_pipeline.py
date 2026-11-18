@@ -483,3 +483,141 @@ def test_golden_reference_extraction_benchmark(fmt: str, fixture_path: str):
     for gold_proj, got_proj in zip(gold["projects"], projects):
         assert list(got_proj.keys()) == pp.FIELDS
         assert got_proj == gold_proj
+
+
+# ----------------------------------------------------------------------
+# 21. Regression Tests: 2023 Zamzam Annual Report & 2028 Independent Plan
+# ----------------------------------------------------------------------
+def test_zamzam_2023_annual_report_regression():
+    zamzam_path = os.path.join(FIXTURES_DIR, "التقرير_السنوي_جمعية_زمزم_2023.md")
+    with open(zamzam_path, encoding="utf-8") as f:
+        zamzam_md = f.read()
+
+    # 1. Verify full end-to-end extraction on the 56-page Zamzam 2023 report
+    res = handler.handler({"input": {"text": zamzam_md}})
+    assert "error" not in res
+    assert res["summary"]["year"] == 2023
+
+    programs = {p["name"]: p for p in res["programs"]}
+    projects = {p["name"]: p for p in res["projects"]}
+    all_by_name = {**programs, **projects}
+
+    # Issue 1: Previously missing entities must be extracted with exact beneficiaries & budgets
+    assert "العلاج الخيري" in programs
+    assert programs["العلاج الخيري"]["beneficiaries_count"] == 15946
+    assert programs["العلاج الخيري"]["budget"] == 23311508
+
+    assert "جهازك حياة" in projects
+    assert projects["جهازك حياة"]["beneficiaries_count"] == 471
+    assert projects["جهازك حياة"]["budget"] == 1539935
+
+    assert "العيادات الموسمية (الحج)" in projects
+    assert projects["العيادات الموسمية (الحج)"]["beneficiaries_count"] == 1298
+
+    # Umbrella sections properly classified as programs with non-double-counting notes
+    for umbrella_name, expected_benef in [
+        ("تعزيز الصحة والوقاية", 60516),
+        ("البرامج الميدانية", 33900),
+        ("معهد زمزم المعرفي للتدريب", 453),
+    ]:
+        assert umbrella_name in programs
+        assert programs[umbrella_name]["type"] == "program"
+        assert programs[umbrella_name]["beneficiaries_count"] == expected_benef
+
+    # Issue 2: All 5 previously deleted beneficiary counts must be preserved
+    expected_beneficiaries = {
+        "الاستشارات الطبية": 28428,
+        "مبادرة تعزيز الصحة في المواسم": 2372,
+        "أنت ثروة": 160,
+        "محطة قطار الحرمين": 1165,
+        "عيادة الرعاية الأولية بجدة": 402,
+    }
+    for ent_name, exp_count in expected_beneficiaries.items():
+        assert ent_name in projects, f"Missing project: {ent_name}"
+        assert projects[ent_name]["beneficiaries_count"] == exp_count
+
+    # Issue 3: All 6 entities explicitly named "مشروع ..." must be classified as `project`, never `program`
+    six_explicit_projects = [
+        "مشروع رعاية الحوامل",
+        "مشروع حالات منصة شفاء",
+        "مشروع حالات مصابي الفتاق البطني",
+        "مشروع حالات مصابي العظام",
+        "مشروع دعمهم يبصرون",
+        "مشروع فرحة عاجز",
+    ]
+    for proj_name in six_explicit_projects:
+        assert proj_name in projects
+        assert projects[proj_name]["type"] == "project"
+        assert proj_name not in programs
+
+    # Issue 4: Description and delivery_method must NEVER be identical duplicates on any entity
+    for ent_name, ent in all_by_name.items():
+        if ent["description"] is not None and ent["delivery_method"] is not None:
+            assert ent["description"] != ent["delivery_method"], f"Duplicated desc/delivery on {ent_name}"
+
+    # Issue 5 & 6: Verbatim name preservation ("تعزيز الصحة عبر وسائل التواصل الاجتماعي") & needs_attention flag
+    assert "تعزيز الصحة عبر وسائل التواصل الاجتماعي" in projects
+    assert "تأهيل الصحة عبر وسائل التواصل الاجتماعي" not in all_by_name
+
+    # Simulate LLM output with the altered name "تأهيل الصحة عبر وسائل التواصل الاجتماعي" and wrong "program" type
+    ing = ingestion.ingest_markdown_or_text(zamzam_md, filename="zamzam.md")
+    review_flags: list[dict[str, str]] = []
+    simulated_llm = [
+        {
+            "type": "program",
+            "name": "تأهيل الصحة عبر وسائل التواصل الاجتماعي",
+            "year": 2023,
+            "description": None,
+            "beneficiaries_count": 245485,
+            "budget": None,
+            "beneficiary_value": None,
+            "target_audience": None,
+            "delivery_method": "نعمل على رفع الوعي وتعزيز الثقافة الصحية من خلال نشر رسائل ومقاطع ومحاضرات توعوية صحية عبر وسائل التواصل الاجتماعي.",
+            "notes": None,
+        },
+        {
+            "type": "program",
+            "name": "مشروع رعاية الحوامل",
+            "year": 2023,
+            "description": None,
+            "beneficiaries_count": None,
+            "budget": None,
+            "beneficiary_value": None,
+            "target_audience": None,
+            "delivery_method": "لكل 1 ريال سعودي تم استثماره كان العائد المجتمعي على الاستثمار 2.30 ريال سعودي.",
+            "notes": None,
+        },
+    ]
+    reconciled = pp.enrich_and_reconcile_entities(simulated_llm, ing["pages"], default_year=2023, review=review_flags)
+    resp_reconciled = pp.build_contract_response(reconciled, year=2023, review=review_flags)
+    assert resp_reconciled["needs_attention"] is True
+    assert any("تم تصحيح الاسم" in r["reason"] for r in review_flags)
+    assert any("تم تصحيح التصنيف" in r["reason"] for r in review_flags)
+    assert any("تم استرجاع العنصر" in r["reason"] for r in review_flags)
+
+
+def test_independent_2028_extraction():
+    ind_path = os.path.join(FIXTURES_DIR, "athar_independent_extraction_test_2028.md")
+    with open(ind_path, encoding="utf-8") as f:
+        ind_md = f.read()
+
+    res = handler.handler({"input": {"text": ind_md}})
+    assert "error" not in res
+    assert res["summary"]["association_name"] == "جمعية الأمل للتنمية المجتمعية"
+    assert res["summary"]["year"] == 2028
+    assert res["summary"]["programs_count"] == 1
+    assert res["summary"]["projects_count"] == 2
+
+    prog = res["programs"][0]
+    assert prog["name"] == "جسور المعرفة"
+    assert prog["type"] == "program"
+    assert prog["budget"] == 187650
+    assert prog["beneficiaries_count"] == 73
+    assert prog["target_audience"] == "كبار السن في القرى"
+    assert prog["description"] != prog["delivery_method"]
+
+    projs = {p["name"]: p for p in res["projects"]}
+    assert projs["مهارات الهاتف الذكي"]["budget"] == 92650
+    assert projs["مهارات الهاتف الذكي"]["beneficiaries_count"] == 41
+    assert projs["نافذة الخدمات الإلكترونية"]["budget"] == 95000
+    assert projs["نافذة الخدمات الإلكترونية"]["beneficiaries_count"] == 32

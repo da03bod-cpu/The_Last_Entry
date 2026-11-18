@@ -49,6 +49,6 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
             ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:v2.0.0
+            ${{ env.IMAGE }}:v2.1.0
             ${{ env.IMAGE }}:sha-${{ env.SHORT_SHA }}
             ${{ env.IMAGE }}:${{ github.sha }}

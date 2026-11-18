@@ -8,7 +8,7 @@ python -m pytest -v
 python -m ruff check config.py ingestion.py postprocess.py handler.py benchmark_report.py tests/
 ```
 
-**Outcome**: **17 passed, 0 failed** (`2.48s`), Ruff linter: **All checks passed!**
+**Outcome**: **19 passed, 0 failed** (`2.59s`), Ruff linter: **All checks passed!**
 
 | # | Test Case | Area Covered | Status |
 |---|---|---|---|
@@ -29,6 +29,8 @@ python -m ruff check config.py ingestion.py postprocess.py handler.py benchmark_
 | 15 | `test_golden_reference_extraction_benchmark[docx]` | End-to-end extraction on `الخطة_التشغيلية_والموازنة_التقديرية_2027.docx` vs. Golden JSON | **PASSED** |
 | 16 | `test_golden_reference_extraction_benchmark[xlsx]` | End-to-end extraction on `الخطة_التشغيلية_والموازنة_التقديرية_2027.xlsx` vs. Golden JSON | **PASSED** |
 | 17 | `test_golden_reference_extraction_benchmark[pdf]` | End-to-end extraction on original 72-page PDF (`جمعية البر الخيرية بالثنية (وصال) الخطة التشغيلية والموازنة التقديرية 2027.pdf`) vs. Golden JSON | **PASSED** |
+| 18 | `test_zamzam_2023_annual_report_regression` | 56-page Zamzam 2023 Annual Report regression test: missing entities (`العلاج الخيري`, `جهازك حياة`, `العيادات الموسمية (الحج)`), umbrella programs (`تعزيز الصحة والوقاية`, `البرامج الميدانية`, `معهد زمزم المعرفي للتدريب`), 5 preserved beneficiary counts (`28,428`, `2,372`, `160`, `1,165`, `402`), 6 `مشروع` classifications, distinct `description` vs `delivery_method`, verbatim name snapping, and `needs_attention` diagnostics | **PASSED** |
+| 19 | `test_independent_2028_extraction` | Independent 2028 operational plan (`جمعية الأمل للتنمية المجتمعية`): program `جسور المعرفة` + subordinate projects `مهارات الهاتف الذكي` and `نافذة الخدمات الإلكترونية` | **PASSED** |
 
 ---
 

@@ -373,46 +373,47 @@ def run_chunk(user_text: str) -> tuple[str, dict[str, Any]]:
 
 def _identify_non_card_pages(pages: list[tuple[int, str]]) -> list[tuple[int, str]]:
     """Return pages that are NOT already covered by deterministic structural program/project cards
-    (or summary TOC/budget tables of those exact cards) so the LLM only runs on unstructured narrative pages.
+    or structured Markdown report sections so the LLM only runs on unstructured narrative pages.
     """
     card_pages = pp.extract_structured_cards(pages)
-    if not card_pages:
-        return pages
+    if card_pages:
+        unstructured: list[tuple[int, str]] = []
+        for p_no, body in pages:
+            if not body or not body.strip():
+                continue
+            if pp.CARD_CODE_RE.search("\n".join(body.splitlines()[:6])):
+                continue
+            if any(
+                marker in body
+                for marker in (
+                    "الفهرس",
+                    "الخطة في أرقام",
+                    "آلية الترقيم",
+                    "خارطة التنفيذ",
+                    "رحلة التنفيذ",
+                    "في هذا البرنامج",
+                    "في هذا القسم",
+                    "ملخص الموازنة التقديرية",
+                    "تكلفة المشاريع ومدد تنفيذها",
+                    "نموذج الموازنة الربعي",
+                    "الموازنة الشهرية",
+                    "المصاريف التشغيلية",
+                    "71ملاحظات",
+                    "ورقة عمل Excel:",
+                )
+            ):
+                continue
+            if len(body.strip()) < 160:
+                continue
+            unstructured.append((p_no, body))
+        return unstructured
 
-    # If the document is a structured operational plan with >= 5 cards, check which pages are free-form narrative
-    unstructured: list[tuple[int, str]] = []
-    for p_no, body in pages:
-        if not body or not body.strip():
-            continue
-        # Card pages or continuation pages
-        if pp.CARD_CODE_RE.search("\n".join(body.splitlines()[:6])):
-            continue
-        # TOC, overview, numbering guide, budget summary, or empty notes pages in operational plans
-        if any(
-            marker in body
-            for marker in (
-                "الفهرس",
-                "الخطة في أرقام",
-                "آلية الترقيم",
-                "خارطة التنفيذ",
-                "رحلة التنفيذ",
-                "في هذا البرنامج",
-                "في هذا القسم",
-                "ملخص الموازنة التقديرية",
-                "تكلفة المشاريع ومدد تنفيذها",
-                "نموذج الموازنة الربعي",
-                "الموازنة الشهرية",
-                "المصاريف التشغيلية",
-                "71ملاحظات",
-                "ورقة عمل Excel:",
-            )
-        ):
-            continue
-        # Cover / back-cover pages with < 150 chars
-        if len(body.strip()) < 160:
-            continue
-        unstructured.append((p_no, body))
-    return unstructured
+    # Check if the document is a structured Markdown report with explicit ## / ### entity sections
+    md_sections = pp.extract_markdown_report_sections(pages)
+    if len(md_sections) >= 3:
+        return []
+
+    return pages
 
 
 def extract_document(job_input: dict[str, Any]) -> dict[str, Any]:
@@ -473,18 +474,17 @@ def extract_document(job_input: dict[str, Any]) -> dict[str, Any]:
             t0 = time.time()
             raw, gi = run_chunk(meta_block + body)
             obj, repaired = pp.parse_json_output(raw)
-            repaired_any = repaired_any or repaired
-
             # Bounded adaptive sub-splitting if generation truncated (`max_new_tokens`) or failed JSON parse
             if (obj is None or gi["stop_reason"] == "max_new_tokens") and len(ch) > 1 and config.MAX_CHUNK_RETRIES > 0:
                 mid = len(ch) // 2
                 sub_progs: list[dict[str, Any]] = []
                 sub_ok = True
+                sub_repaired = False
                 for sub_ch in (ch[:mid], ch[mid:]):
                     sub_body = pp.render(sub_ch)
                     sub_raw, _ = run_chunk(meta_block + sub_body)
                     sub_obj, sub_rep = pp.parse_json_output(sub_raw)
-                    repaired_any = repaired_any or sub_rep
+                    sub_repaired = sub_repaired or sub_rep
                     if isinstance(sub_obj, dict) and isinstance(sub_obj.get("programs_and_projects"), list):
                         sub_tn = pp.norm(sub_body)
                         for p in sub_obj["programs_and_projects"]:
@@ -495,8 +495,11 @@ def extract_document(job_input: dict[str, Any]) -> dict[str, Any]:
                         sub_ok = False
                 if sub_ok:
                     obj = {"programs_and_projects": sub_progs}
+                    repaired = sub_repaired
                     gi["adaptive_split_recovered"] = True
                     gi["stop_reason"] = "eos"
+
+            repaired_any = repaired_any or repaired
 
             gi.update(
                 {
@@ -525,6 +528,7 @@ def extract_document(job_input: dict[str, Any]) -> dict[str, Any]:
         merged_model_entities,
         pages,
         default_year=year if isinstance(year, int) else None,
+        review=review,
     )
 
     needs_attention = any(c.get("parse_error") or c.get("stop_reason") != "eos" for c in info)

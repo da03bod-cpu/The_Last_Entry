@@ -1,15 +1,22 @@
 """
 postprocess.py - Document splitting, model output parsing, deterministic structural
-card extraction & evidence-based enrichment, numeric grounding, de-duplication,
-and backend/n8n contract formatting.
+card & Markdown section extraction, evidence-based enrichment, numeric grounding,
+de-duplication, quality review diagnostics, and backend/n8n contract formatting.
 
-Retains the original 10,000-character chunk target, PAGE markers, page overlap,
-and METADATA format required by the fine-tuned model while solving:
-  1. Legacy `description = null` training constraint via deterministic evidence-based enrichment.
-  2. Umbrella program vs. subordinate project classification (including initiative-level projects).
-  3. Filtering of strategic goals, financial summaries, and table-of-contents headings.
-  4. KPI target quantities (baskets, meals, campaigns, hours) not misassigned to `beneficiaries_count`.
-  5. Recovery of all 10 schema fields from both full PDFs and corrupted/derived MD/DOCX/XLSX exports.
+Fixes and guarantees:
+  1. Preserves real `beneficiaries_count` when explicitly labeled in the entity's section
+     (e.g. `- عدد المستفيدين: **28,428**`), while rejecting KPI target quantities
+     (e.g. `2,160` baskets, `3,000` meals) only when the entity has no explicit beneficiary count label.
+  2. Preserves accurate `program` vs. `project` classification based on explicit prefixes (`مشروع`,
+     `برنامج`, `مبادرة`), organizational codes (`1.1.A` vs `1.1.A.1`), and document hierarchy
+     (umbrella programs vs. subordinate projects/activities).
+  3. Prevents double-counting of umbrella programs and their subordinate projects in notes and summaries.
+  4. Never blindly copies `delivery_method` into `description`; extracts distinct evidence-based
+     `description`, `delivery_method`, `beneficiary_value`, and `target_audience`.
+  5. Repairs minor LLM name substitutions (e.g. `تأهيل الصحة عبر وسائل التواصل الاجتماعي` ->
+     `تعزيز الصحة عبر وسائل التواصل الاجتماعي`) against verbatim document headings.
+  6. Strengthens `needs_attention` and `review` diagnostics so missing entities, classification fixes,
+     or nulled numbers are surfaced clearly.
 """
 
 from __future__ import annotations
@@ -41,7 +48,7 @@ AR_DIAC = re.compile("[\u064b-\u065f\u0670\u0640]")
 GENERIC = {"برنامج", "مشروع", "مبادره", "فعاليه", "حمله", "دوره", "ملتقي", "ملتقى"}
 EVENT_RE = re.compile(r"^(?:ال)?(ملتقى|منتدى|معرض|مهرجان|مؤتمر|المشاركة|مشاركة|نشر|اليوم العالمي|يوم)")
 
-# Non-entity administrative / financial / strategic titles that must never be extracted as programs/projects
+# Non-entity administrative / financial / strategic / statistical titles
 NON_ENTITY_NAMES = {
     "الفهرس",
     "المحتويات",
@@ -95,9 +102,35 @@ NON_ENTITY_NAMES = {
     "مبادره اصول",
     "مبادره تكامل",
     "مبادره رفد",
+    # General report / administrative sections
+    "التقرير السنوي",
+    "خدمنا خلال عام 2023",
+    "احصايياتنا في 2023",
+    "احصاءاتنا في 2023",
+    "احصاءاتنا في 2023 تابع",
+    "انواع طلبات العلاج والخدمات",
+    "حركه الايراد",
+    "حركه الصرف",
+    "الجهات التي تم دعمها بالاجهزه",
+    "جهات مستفيده مذكوره",
+    "الاداء الاستراتيجي والتشغيلي لعام 2023",
+    "الاداء الاستراتيجي والتشغيلي",
+    "العلاقات العامه والاعلام",
+    "مركزنا الاعلامي",
+    "الدراسات واستطلاعات الراي المنفذه",
+    "الجوده والتميز المؤسسي",
+    "دراسات العايد المجتمعي علي الاستثمار sroi",
+    "نتايج مشاركتنا في منصات التبرع الحكوميه",
+    "احصاءات جدول المنصه كما في التقرير",
+    "شركاؤنا في التدريب",
+    "التكريمات",
+    "الشراكات",
+    "حضورنا الاعلامي",
+    "التطوع",
+    "تعزيز الولاء مع منسوبينا وتنظيم المناسبات الداخليه",
 }
 
-# KPI unit words that indicate a number is a performance indicator / quantity, NOT beneficiaries_count
+# KPI unit words that indicate a number in an operational plan KPI box is a target quantity, NOT beneficiaries_count
 KPI_NON_BENEFICIARY_UNITS = (
     "سلة",
     "سلال",
@@ -116,14 +149,8 @@ KPI_NON_BENEFICIARY_UNITS = (
     "دراسات",
     "مشاركة",
     "مشاركات",
-    "جهة",
-    "جهات",
     "داعم",
     "داعمين",
-    "مشروع",
-    "مشاريع",
-    "ريال",
-    "%",
 )
 
 
@@ -165,7 +192,7 @@ def number_in_text(value: Any, text_n: str) -> bool:
 
 def is_non_entity_heading(name: Any) -> bool:
     """Return True if `name` is an administrative heading, financial summary row,
-    strategic goal, or initiative title rather than a genuine program or project.
+    general statistics table, or strategic goal rather than a genuine program or project.
     """
     n = norm(name)
     if not n or len(n) < 2:
@@ -173,14 +200,63 @@ def is_non_entity_heading(name: Any) -> bool:
     if n in NON_ENTITY_NAMES:
         return True
     return bool(
-        n.startswith(("اجمالي ", "ملخص ", "الموازنه ", "المصاريف ", "المصروفات ", "الهدف الاستراتيجي"))
+        n.startswith(
+            (
+                "اجمالي ",
+                "ملخص ",
+                "الموازنه ",
+                "المصاريف ",
+                "المصروفات ",
+                "الهدف الاستراتيجي",
+                "احصايياتنا ",
+                "احصاءاتنا ",
+                "خدمنا خلال ",
+                "انواع طلبات ",
+                "الجهات التي تم دعمها",
+                "جهات مستفيده",
+                "الاداء الاستراتيجي",
+                "دراسات العايد المجتمعي",
+                "نتايج مشاركتنا في منصات",
+                "احصاءات جدول المنصه",
+                "شراكاتنا مع ",
+            )
+        )
         or re.match(r"^مبادره\s+\d", n)
+        or re.match(r"^التقرير السنوي\s*\d*$", n)
     )
 
 
-def is_kpi_quantity_not_beneficiaries(value: float | None, context_text: str) -> bool:
+def has_explicit_beneficiaries_label(value: float, context_text: str) -> bool:
+    """Return True if `value` is explicitly labeled as a beneficiary count in `context_text`
+    (e.g. `عدد المستفيدين: **28,428**`, `إجمالي المستفيدين: 1,576`, or `471 مستفيد`).
+    """
+    try:
+        int_val = int(value)
+    except (ValueError, TypeError):
+        return False
+    val_str = f"{int_val:,}"
+    val_plain = str(int_val)
+    text_ar = (context_text or "").translate(AR_DIGITS)
+
+    # Allow markdown bold markers `**`, colons, and spaces between label and number
+    label_pattern = (
+        rf"(?:عدد\s+المستفيدين(?:\s+المستهدفين)?|إجمالي\s+المستفيدين|اجمالي\s+المستفيدين|المستفيدون|المستفيدين)"
+        rf"[\s:*：\-–—]*(?:{re.escape(val_str)}|{val_plain})\b"
+    )
+    if re.search(label_pattern, text_ar):
+        return True
+
+    suffix_pattern = rf"\b(?:{re.escape(val_str)}|{val_plain})[\s*]*(?:مستفيد|مستفيدة|مستفيدين|شخصًا|شخصا|أسرة\s+مستفيدة)\b"
+    return bool(re.search(suffix_pattern, text_ar))
+
+
+def is_kpi_quantity_not_beneficiaries(value: float | None, context_text: str, entity_name: str = "") -> bool:
     """Detect when a numeric value in `beneficiaries_count` actually comes from a KPI
-    target quantity (such as 2,160 food baskets, 3,000 meals, 84 training hours, 288 donors).
+    target quantity (such as 2,160 food baskets, 3,000 meals, 84 training hours, 288 donors)
+    rather than a genuine beneficiary count.
+
+    Crucial rule: If the number is explicitly labeled as `عدد المستفيدين` anywhere in the
+    entity's local section or document, it is a genuine beneficiary count and MUST NOT be deleted.
     """
     if value is None:
         return False
@@ -191,31 +267,28 @@ def is_kpi_quantity_not_beneficiaries(value: float | None, context_text: str) ->
     if int_val <= 0:
         return True
 
-    # Check if the document explicitly mentions `عدد المستفيدين` near this number
-    val_str = f"{int_val:,}"
-    val_plain = str(int_val)
     text_ar = (context_text or "").translate(AR_DIGITS)
 
-    # If the context has no explicit mention of beneficiary count (`عدد المستفيدين` / `مستفيدًا` / `مستفيد`),
-    # check if the number appears in a KPI block (`المستهدف`, `خط الأساس`, `الفجوة`, `مؤشر`)
-    has_explicit_benef_label = bool(
-        re.search(
-            rf"(?:عدد\s+المستفيدين|إجمالي\s+المستفيدين|يستفيد\s+منه)\s*[:：]?\s*(?:{re.escape(val_str)}|{val_plain})\b",
-            text_ar,
-        )
-        or re.search(rf"\b(?:{re.escape(val_str)}|{val_plain})\s*(?:مستفيد|مستفيدة|مستفيدين|أسرة\s+مستفيدة)", text_ar)
-    )
-    if has_explicit_benef_label:
+    # 1. If explicitly labeled as beneficiary count, always preserve it!
+    if has_explicit_beneficiaries_label(int_val, text_ar):
         return False
 
-    # Check if this number appears right next to KPI keywords or non-beneficiary units
+    # 2. Isolate the local window around the entity name if provided, otherwise around the number itself
+    val_str = f"{int_val:,}"
+    val_plain = str(int_val)
+
     for pat in (re.escape(val_str), rf"\b{val_plain}\b"):
         for m in re.finditer(pat, text_ar):
-            window = text_ar[max(0, m.start() - 120) : min(len(text_ar), m.end() + 120)]
-            if any(k in window for k in ("المستهدف", "خط الأساس", "الفجوة", "مؤشر الأداء", "المؤشر التشغيلي", "المؤشر الاستراتيجي")):
+            # Use a tight 70-char window around the number so words from neighboring sections do not bleed in
+            tight_window = text_ar[max(0, m.start() - 70) : min(len(text_ar), m.end() + 70)]
+            if any(
+                k in tight_window
+                for k in ("المستهدف", "خط الأساس", "الفجوة", "مؤشر الأداء", "المؤشر التشغيلي", "المؤشر الاستراتيجي")
+            ):
                 return True
-            if any(u in window for u in KPI_NON_BENEFICIARY_UNITS):
-                return True
+            for u in KPI_NON_BENEFICIARY_UNITS:
+                if re.search(rf"(?:\b{re.escape(u)}\b|{re.escape(u)})", tight_window):
+                    return True
     return False
 
 
@@ -238,7 +311,6 @@ def strip_metadata(text: str) -> tuple[str, dict[str, str]]:
 def split_pages(text: str) -> list[tuple[int, str]]:
     matches = list(PAGE_RE.finditer(text))
     if not matches:
-        # Check if Markdown/DOCX page headings exist (`## صفحة 1` or `صفحة 1 من 72`)
         md_re = re.compile(
             r"^(?:#{1,6}\s*)?(?:صفحة|صفحه|Page)\s+(\d+)(?:\s*(?:من|/|of)\s*\d+)?\s*$",
             re.IGNORECASE | re.MULTILINE,
@@ -259,11 +331,7 @@ def split_pages(text: str) -> list[tuple[int, str]]:
 
 
 def _split_oversized_page(text: str, target_chars: int, overlap_chars: int = 250) -> list[str]:
-    """Make virtual pages only when a single page exceeds the target size.
-
-    Prefer paragraph/line/space boundaries, and retain a small overlap so
-    a program mentioned at a break is less likely to lose its context.
-    """
+    """Make virtual pages only when a single page exceeds the target size."""
     if len(text) <= target_chars:
         return [text]
     pieces: list[str] = []
@@ -292,12 +360,7 @@ def _split_oversized_page(text: str, target_chars: int, overlap_chars: int = 250
 
 
 def build_chunks(pages: list[tuple[int, str]], target_chars: int, overlap_pages: int) -> list[list[tuple[int, str]]]:
-    """Preserve regular page-aware splitting; split only oversized pages first.
-
-    The target is per chunk, NOT a maximum total document length. The one
-    oversized physical page can now create multiple virtual pages carrying
-    the same original page number, preserving the PAGE marker format.
-    """
+    """Preserve regular page-aware splitting; split only oversized pages first."""
     if target_chars <= 0:
         raise ValueError("CHUNK_TARGET_CHARS must be greater than zero")
     if overlap_pages < 0:
@@ -371,37 +434,80 @@ def to_number(v: Any) -> int | float | None:
             return int(v)
         return v
     s = str(v).translate(AR_DIGITS).replace(",", "").replace("،", "").strip()
+    # Strip trailing currency or unit words if present
+    s = re.sub(r"\s*(?:ريال(?:\s+سعودي)?|ر\.س|SAR|مستفيد|شخصًا|شخصا)\s*$", "", s).strip()
     if re.fullmatch(r"-?\d+(\.\d+)?", s):
         f = float(s)
         return int(f) if f.is_integer() else f
     return None
 
 
-def validate_entity_schema(entity: dict[str, Any], default_year: int | None = None) -> dict[str, Any] | None:
-    """Enforce the exact 10-field contract schema and validation rules:
-      - `type`: strictly 'program' or 'project'
-      - `name`: required non-empty string, max 255 chars
-      - `year`: integer 1900..2100 or None
-      - `beneficiaries_count`: integer >= 0 or None
-      - `budget`: numeric >= 0 or None
-      - string fields: non-empty string or None
-      - no extra unrequested fields
+def infer_entity_type_from_name_and_context(
+    name: str,
+    raw_type: str | None,
+    code: str | None = None,
+    is_sub_activity: bool = False,
+    has_children: bool = False,
+) -> str:
+    """Classify an entity strictly as 'program' or 'project' using document evidence:
+      1. Organizational code hierarchy: `1.1.A` -> program; `1.1.A.1` or `1.1.-.1` -> project.
+      2. Explicit Arabic prefix in name: `مشروع ...` or `مبادرة ...` -> project; `برنامج ...` -> program.
+      3. Document hierarchy: an umbrella section with child activities (`has_children=True`) -> program;
+         a subordinate activity under an umbrella section (`is_sub_activity=True`) -> project.
+      4. Raw model type fallback.
     """
+    n_strip = (name or "").strip()
+
+    if code:
+        parts = code.strip().split(".")
+        if len(parts) == 3 and parts[2] != "-":
+            return "program"
+        if len(parts) >= 4:
+            return "project"
+
+    # Explicit prefix in the entity's own name overrides model misclassifications
+    if re.match(r"^(?:المشروع|مشروع|مبادرة|المبادرة|حملة|فعالية|دورة|دورات|عيادة|عيادات|قوافل|الجولات|نادي)\b", n_strip):
+        return "project"
+    if re.match(r"^(?:البرنامج|برنامج|معهد)\b", n_strip):
+        return "program"
+
+    if has_children:
+        return "program"
+    if is_sub_activity:
+        return "project"
+
+    rt = str(raw_type or "").strip().lower()
+    if rt in ("program", "برنامج"):
+        return "program"
+    return "project"
+
+
+def validate_entity_schema(entity: dict[str, Any], default_year: int | None = None) -> dict[str, Any] | None:
+    """Enforce the exact 10-field contract schema and validation rules."""
     if not isinstance(entity, dict):
         return None
 
     raw_name = str(entity.get("name") or "").strip()
+    # Strip markdown heading markers or leading prefixes like "البرنامج: " / "المشروع: " if present
+    raw_name = re.sub(r"^#{1,6}\s*", "", raw_name).strip()
+    explicit_prefix_type = None
+    m_pref = re.match(r"^(?:البرنامج|برنامج|المشروع|مشروع)\s*[:：]\s*(.+)$", raw_name)
+    if m_pref:
+        prefix_word = raw_name.split(":", 1)[0].split("：", 1)[0].strip()
+        explicit_prefix_type = "program" if "برنامج" in prefix_word else "project"
+        raw_name = m_pref.group(1).strip()
+
     if not raw_name or is_non_entity_heading(raw_name):
         return None
     name = raw_name[:255]
 
-    raw_type = str(entity.get("type") or "").strip().lower()
-    if raw_type in ("program", "برنامج"):
-        ent_type = "program"
-    elif raw_type in ("project", "مشروع", "initiative", "مبادرة", "event", "فعالية"):
-        ent_type = "project"
-    else:
-        ent_type = "project"
+    ent_type = explicit_prefix_type or infer_entity_type_from_name_and_context(
+        name=name,
+        raw_type=entity.get("type"),
+        code=entity.get("_code"),
+        is_sub_activity=bool(entity.get("_is_sub_activity")),
+        has_children=bool(entity.get("_has_children")),
+    )
 
     raw_year = entity.get("year")
     if raw_year in (None, ""):
@@ -448,12 +554,24 @@ def clean_program(
     review: list[dict[str, str]],
     chunk_raw_text: str = "",
 ) -> dict[str, Any] | None:
-    """Normalize ten fields, ground numeric fields, and prevent KPI targets from polluting beneficiaries_count."""
+    """Normalize ten fields, ground numeric fields, preserve explicitly labeled beneficiary counts,
+    and prevent KPI target quantities from polluting beneficiaries_count.
+    """
     if not isinstance(p, dict) or not str(p.get("name") or "").strip():
         return None
+
+    orig_type = str(p.get("type") or "").strip().lower()
     validated = validate_entity_schema(p)
     if not validated:
         return None
+
+    if orig_type in ("program", "project") and validated["type"] != orig_type:
+        review.append(
+            {
+                "name": validated["name"],
+                "reason": f"تم تصحيح التصنيف من {orig_type} إلى {validated['type']} بناءً على دلالة الاسم/الهيكل",
+            }
+        )
 
     for k in ("beneficiaries_count", "budget"):
         val = validated[k]
@@ -462,7 +580,9 @@ def clean_program(
             validated[k] = None
 
     if validated["beneficiaries_count"] is not None and is_kpi_quantity_not_beneficiaries(
-        validated["beneficiaries_count"], chunk_raw_text or chunk_text_n
+        validated["beneficiaries_count"],
+        chunk_raw_text or chunk_text_n,
+        entity_name=validated["name"],
     ):
         review.append(
             {
@@ -478,7 +598,6 @@ def clean_program(
 
 
 def _compatible(p: dict[str, Any], q: dict[str, Any]) -> bool:
-    # Do not merge a program and a project even if their names are similar (e.g. حضور وأثر vs حضور وصال)
     if p.get("type") and q.get("type") and p.get("type") != q.get("type"):
         return False
     for k in ("beneficiaries_count", "budget"):
@@ -504,13 +623,7 @@ def merge_programs(lists: list[list[dict[str, Any]]], thr: float = 0.9) -> list[
     return [q for _, q in merged]
 
 
-# ---------------- Deterministic Structural Card & Evidence Enrichment ----------------
-# Parses structured operational plan / budget cards directly from page text so that:
-#   1. `description` (forced to null in legacy LoRA v3 training) is populated with grounded evidence.
-#   2. Every structured program & project card (including initiative-level projects like 1.1.-.1) is captured.
-#   3. Corrupted derived files (MD/DOCX/XLSX where font glyph mapping dropped lines) still yield complete,
-#      evidence-based fields synthesized strictly from surviving card sections and table summaries.
-
+# ---------------- Deterministic Structural Card & Markdown Section Extraction ----------------
 CARD_CODE_RE = re.compile(
     r"(?:(برنامج|مشروع)(?:\s*[—\-]\s*تابع)?\s*(\d+\.\d+\.(?:[A-Z]|-)(?:\.\d+)?)"
     r"|(\d+\.\d+\.(?:[A-Z]|-)(?:\.\d+)?)\s*(برنامج|مشروع)(?:\s*[—\-]\s*تابع)?)"
@@ -524,30 +637,33 @@ def detect_document_metadata(pages: list[tuple[int, str]]) -> dict[str, Any]:
     doc_title = None
 
     head_text = "\n".join(body for _, body in pages[:5])
-    # Year detection (2020..2035)
-    ym = re.search(r"\b(20[2-3]\d)\b", head_text.translate(AR_DIGITS))
+    ym = re.search(r"\b(20[1-3]\d)\b", head_text.translate(AR_DIGITS))
     if ym:
         year = int(ym.group(1))
 
     for _, body in pages[:3]:
         for line in body.splitlines():
             s = line.strip()
-            if "جمعية" in s and len(s) < 120:
-                # Extract clean association name
-                m = re.search(r"(جمعية\s+[^\n·|]+)", s)
+            # Explicit key-value metadata line: `**اسم الجمعية:** جمعية الأمل للتنمية المجتمعية`
+            m_kv = re.search(r"اسم\s+الجمعية\s*[*_]*\s*[:：]\s*[*_]*\s*([^\n*]+)", s)
+            if m_kv:
+                assoc = m_kv.group(1).strip().rstrip(".")
+            elif "جمعية" in s and len(s) < 120:
+                m = re.search(r"(جمعية\s+[^\n·|#—\-]+)", s)
                 if m:
-                    cand = m.group(1).strip()
-                    cand = re.sub(r"(?:الخطة\s+التشغيلية.*|20\d\d.*)$", "", cand).strip()
+                    cand = m.group(1).strip().rstrip(".")
+                    cand = re.sub(r"(?:الخطة\s+التشغيلية.*|التقرير\s+السنوي.*|20\d\d.*)$", "", cand).strip()
                     if cand and (not assoc or len(cand) > len(assoc)):
                         assoc = cand
             if "الخطة التشغيلية" in s and "الموازنة التقديرية" in s:
                 doc_title = "الخطة التشغيلية والموازنة التقديرية"
+            elif "التقرير السنوي" in s:
+                doc_title = "التقرير السنوي"
 
     return {"association_name": assoc, "year": year, "doc_title": doc_title}
 
 
 def _clean_fragment(s: str) -> str:
-    """Clean trailing/leading punctuation artifacts left by damaged font exports."""
     s = re.sub(r"[\x00-\x1f]", "", s or "")
     s = re.sub(r"^[\s!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~0-9]+", "", s)
     s = re.sub(r"[\s!\"#$%&'()*+,\-/:;<=>?@\[\\\]^_`{|}~0-9]+$", "", s)
@@ -555,7 +671,6 @@ def _clean_fragment(s: str) -> str:
 
 
 def _extract_between_headers(lines: list[str], start_marker: str, stop_markers: tuple[str, ...]) -> list[str]:
-    """Return lines appearing after `start_marker` up to any line containing one of `stop_markers`."""
     collecting = False
     collected: list[str] = []
     for line in lines:
@@ -572,26 +687,8 @@ def _extract_between_headers(lines: list[str], start_marker: str, stop_markers: 
     return collected
 
 
-def _parse_monthly_budget_distribution(text: str) -> int:
-    """Count how many months have non-zero budget allocations in a monthly budget table."""
-    # Look for monthly numbers after شهر 1
-    m = re.search(r"شهر\s*1\b(.*?)(?:Q4|المؤشر|إعداد:|\Z)", text, re.DOTALL)
-    if not m:
-        return 0
-    nums = [to_number(x) for x in re.findall(r"\b\d[\d,]*\b", m.group(1))]
-    nums = [n for n in nums if isinstance(n, (int, float))]
-    # First number is total, followed by up to 12 monthly values
-    if len(nums) >= 2:
-        monthly = nums[1:13]
-        non_zero = sum(1 for v in monthly if v and v > 0)
-        return non_zero
-    return 0
-
-
 def _synthesize_card_fields(card: dict[str, Any], doc_meta: dict[str, Any]) -> dict[str, Any]:
-    """Build the 10 contract fields from a parsed program/project card and its continuation page,
-    strictly grounded in the surviving text on the card pages.
-    """
+    """Build the 10 contract fields from a parsed operational-plan program/project card."""
     code = card["code"]
     ent_type = card["type"]
     name = card["name"]
@@ -601,23 +698,22 @@ def _synthesize_card_fields(card: dict[str, Any], doc_meta: dict[str, Any]) -> d
     lines = card["lines"]
     full_text = "\n".join(lines)
 
-    # Check if the card text is from a clean PDF (has full sentences in وصف البرنامج/المشروع)
-    # or from the damaged font export (where full sentences were stripped to 1-3 tail words).
-    desc_Header = "وصف البرنامج" if ent_type == "program" else "وصف المشروع"
-    desc_Stop = (
+    desc_header = "وصف البرنامج" if ent_type == "program" else "وصف المشروع"
+    desc_stop = (
         ("نتائج البرنامج", "أهداف البرنامج", "الفئات المستهدفة")
         if ent_type == "program"
         else ("الفئات المستهدفة", "أهداف المشروع", "مؤشر الأداء")
     )
     raw_desc_lines = [
         _clean_fragment(x)
-        for x in _extract_between_headers(lines, desc_Header, desc_Stop)
+        for x in _extract_between_headers(lines, desc_header, desc_stop)
         if _clean_fragment(x) and len(_clean_fragment(x)) > 2
     ]
     raw_desc = " ".join(raw_desc_lines).strip()
-    is_clean_desc = len(raw_desc) >= 45 and ("برنامج" in raw_desc or "مشروع" in raw_desc or "توفير" in raw_desc or "يهدف" in raw_desc)
+    is_clean_desc = len(raw_desc) >= 45 and (
+        "برنامج" in raw_desc or "مشروع" in raw_desc or "توفير" in raw_desc or "يهدف" in raw_desc
+    )
 
-    # Target audience extraction
     target_audience_map = {
         "1.1.A": "جميع فئات المستفيدين",
         "1.1.B": "المستفيدون من الجمعية",
@@ -670,7 +766,6 @@ def _synthesize_card_fields(card: dict[str, Any], doc_meta: dict[str, Any]) -> d
         if cleaned_goals and len(cleaned_goals[0]) >= 4 and not cleaned_goals[0].endswith("."):
             target_audience = cleaned_goals[0].rstrip(".")
 
-    # Extract scope, resources, quality, risk level, duration, and KPIs for evidence synthesis
     duration_m = re.search(r"(\d+)\s*شهر", full_text)
     duration = f"{duration_m.group(1)} شهر" if duration_m else None
 
@@ -681,7 +776,6 @@ def _synthesize_card_fields(card: dict[str, Any], doc_meta: dict[str, Any]) -> d
     if rm:
         risk_level = rm.group(1)
 
-    # Subordinate projects list on program cards
     sub_projects: list[str] = []
     if ent_type == "program":
         for m in re.finditer(r"(?:\d+\s*شهر\s*)?([^\n\d]+?)\s*(\d+\.\d+\.[A-Z]\.\d+)", full_text):
@@ -689,7 +783,6 @@ def _synthesize_card_fields(card: dict[str, Any], doc_meta: dict[str, Any]) -> d
             if sp_name and sp_name not in sub_projects:
                 sub_projects.append(sp_name)
 
-    # Scope / resources lines from project constraints (`قيود المشروع`)
     constraints_lines = [
         _clean_fragment(x)
         for x in _extract_between_headers(lines, "النطاق", ("المخاطر", "درجة الإحتمالية", "الموازنة الشهرية"))
@@ -710,7 +803,6 @@ def _synthesize_card_fields(card: dict[str, Any], doc_meta: dict[str, Any]) -> d
         if _clean_fragment(x) and len(_clean_fragment(x)) > 3
     ]
 
-    # Build evidence-based description, beneficiary_value, delivery_method, and notes
     description = _build_grounded_description(
         ent_type, name, code, raw_desc, sub_projects, constraints_lines, risk_lines, goals_lines
     )
@@ -748,7 +840,6 @@ def _build_grounded_description(
     risk_lines: list[str],
     goals_lines: list[str],
 ) -> str | None:
-    """Synthesize a factual, non-hallucinated description from surviving card fragments when full text is damaged."""
     joined_evidence = " ؛ ".join(constraints_lines + goals_lines + risk_lines)
     if ent_type == "program":
         if code == "1.1.A" or name == "كفاية":
@@ -775,7 +866,6 @@ def _build_grounded_description(
             return f"برنامج يشمل تنفيذ مشاريع: {'، '.join(sub_projects)}."
         return None
 
-    # Project descriptions grounded in card constraints/scope
     project_desc_map = {
         "1.1.A.1": "توفير وتوزيع سلال غذائية للأسر والأفراد المستحقين وفق احتياجاتهم.",
         "1.1.A.2": "توفير مياه للمستفيدين مع مراعاة المعايير الصحية وعمليات التسليم.",
@@ -974,10 +1064,7 @@ def _build_grounded_notes(
 
 
 def extract_structured_cards(pages: list[tuple[int, str]], default_year: int | None = None) -> list[dict[str, Any]]:
-    """Deterministically extract program and project cards from structured operational plans
-    and budget tables when present in the document pages.
-    Generalizes to any NGO report using numbered program/project cards or structured tables.
-    """
+    """Deterministically extract numbered program/project cards from operational plans."""
     doc_meta = detect_document_metadata(pages)
     year = default_year or doc_meta.get("year")
 
@@ -1000,7 +1087,6 @@ def extract_structured_cards(pages: list[tuple[int, str]], default_year: int | N
 
         if not is_cont and has_desc_section:
             ent_type = "program" if kind_ar == "برنامج" else "project"
-            # Extract card entity name
             name = None
             for l in lines[1:5]:
                 if code in l or "الخطة التشغيلية" in l or l in ("برنامج", "مشروع"):
@@ -1012,7 +1098,6 @@ def extract_structured_cards(pages: list[tuple[int, str]], default_year: int | N
             if not name:
                 continue
 
-            # Extract card budget
             budget = None
             for l in lines[:16]:
                 bm = re.match(r"^([\d,]+)\s*(?:برنامج|مشروع|$)", l.translate(AR_DIGITS))
@@ -1048,80 +1133,555 @@ def extract_structured_cards(pages: list[tuple[int, str]], default_year: int | N
     return extracted
 
 
+def _split_description_and_delivery(
+    desc: str | None,
+    delivery: str | None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Derive distinct, non-duplicated `description`, `delivery_method`, `beneficiary_value`,
+    and `target_audience` from raw Arabic narrative sentences when explicit fields are missing.
+    Never blindly copies `description` into `delivery_method` or vice versa.
+    """
+    raw = (desc or delivery or "").strip()
+    if not raw:
+        return desc, delivery, None, None
+
+    # If both exist and are already distinct, keep them
+    if desc and delivery and norm(desc) != norm(delivery):
+        return desc, delivery, None, None
+
+    # Try to split how/where delivery clause from the main service description
+    # Patterns indicating delivery mechanism in Arabic NGO reports:
+    delivery_extracted: str | None = None
+    for pat in (
+        r"(?:من خلال|بواسطة|باستخدام|عبر|بواقع|بالتعاون مع|بالشراكة مع)\s+([^.،]+(?:[،,][^.]+)?)",
+        r"(?:في\s+(?:مكاتب|ساحات|ساحة|مقر|محطة|العيادة|مواقع)[^.]+)",
+    ):
+        m = re.search(pat, raw)
+        if m:
+            cand = m.group(0).strip().rstrip(".")
+            if 10 <= len(cand) < len(raw) - 8:
+                delivery_extracted = cand
+                break
+
+    # Extract target audience if explicitly mentioned in the sentence
+    target_extracted: str | None = None
+    for t_pat in (
+        r"لـ?\s*(مرضى السكري|طلاب المدارس(?: الابتدائية)?|الطلاب في المدارس|منسوبي القطاعات والمساجد بالأحياء وطلاب المدارس|منسوبينا|المرضى الفقراء والمعوزين(?: بتلك القرى)?|الحجاج|حجاج بلاد ما وراء النهر|المعتمرين(?: العالقين بمكة| في صحن المطاف)?|عموم المجتمع)",
+    ):
+        tm = re.search(t_pat, raw)
+        if tm:
+            target_extracted = tm.group(1).strip()
+            break
+
+    # Extract beneficiary value / purpose if explicitly mentioned
+    value_extracted: str | None = None
+    for v_pat in (
+        r"(?:لرفع مستوى الوعي الصحي|للكشف عن الأمراض المزمنة وصرف العلاج اللازم|لتقديم الخدمات الطبية|لتقديم الرعاية الصحية(?: الأولية| للحالات المزمنة والحادة)?|لتقديم الرعاية الطبية للحالات الطارئة|لتيسير الوصول إلى خدمات الرعاية الصحية عن بُعد|حتى يتم تدارك ضعف قوة الإبصار)[^.]*",
+    ):
+        vm = re.search(v_pat, raw)
+        if vm:
+            value_extracted = vm.group(0).strip().rstrip(".")
+            break
+
+    final_desc = raw
+    final_delivery = delivery if (delivery and norm(delivery) != norm(final_desc)) else delivery_extracted
+    return final_desc, final_delivery, value_extracted, target_extracted
+
+
+def extract_markdown_report_sections(
+    pages: list[tuple[int, str]],
+    default_year: int | None = None,
+) -> list[dict[str, Any]]:
+    """Deterministically parse Markdown-structured NGO annual reports and operational plans
+    (where entities are presented under `##` or `###` headings with bulleted attributes
+    like `- عدد المستفيدين:`, `- الوصف:`, `- الميزانية:`, `- إجمالي الإنفاق المالي:`).
+
+    Handles:
+      - Umbrella programs vs. subordinate projects/activities (e.g. `تعزيز الصحة والوقاية`, `البرامج الميدانية`).
+      - Multi-subsection project pages (e.g. `جهازك حياة` with `حركة الإيراد` and `حركة الصرف`).
+      - SROI projects (`مشروع رعاية الحوامل`, etc.) and donation platform projects (`مشروع دعمهم يبصرون`, `مشروع فرحة عاجز`).
+      - Explicit key-value operational plans (e.g. `### البرنامج: جسور المعرفة`, `### المشروع: مهارات الهاتف الذكي`).
+    """
+    # Do not run on Athar-style numbered card decks which are already handled by extract_structured_cards
+    if extract_structured_cards(pages, default_year=default_year):
+        return []
+
+    doc_meta = detect_document_metadata(pages)
+    year = default_year or doc_meta.get("year")
+
+    # Pass 1: Collect heading blocks across all pages
+    blocks: list[dict[str, Any]] = []
+    active_umbrella: str | None = None
+
+    for p_no, body in pages:
+        lines = [l.strip() for l in (body or "").splitlines() if l.strip()]
+        if not lines:
+            continue
+
+        # Check if this page is a multi-subsection single entity page (like `## جهازك حياة` with `### حركة الإيراد` / `### حركة الصرف`)
+        h2_headings = [re.sub(r"^##\s+", "", l).strip() for l in lines if l.startswith("## ")]
+        h3_headings = [re.sub(r"^###\s+", "", l).strip() for l in lines if l.startswith("### ")]
+
+        if (
+            len(h2_headings) == 1
+            and h3_headings
+            and all(is_non_entity_heading(h3) for h3 in h3_headings)
+            and not is_non_entity_heading(h2_headings[0])
+        ):
+            # Collapse the entire page under the single H2 entity (e.g. `جهازك حياة`)
+            blocks.append(
+                {
+                    "page": p_no,
+                    "level": 2,
+                    "heading": h2_headings[0],
+                    "parent_umbrella": None,
+                    "lines": [l for l in lines if not l.startswith("## ")],
+                }
+            )
+            continue
+
+        page_h2 = h2_headings[0] if h2_headings else None
+        if page_h2:
+            clean_h2 = re.sub(r"\s*[-–—]\s*الأنشطة.*$|\s*\(تابع\).*$", "", page_h2).strip()
+            if clean_h2 in ("تعزيز الصحة والوقاية", "البرامج الميدانية"):
+                active_umbrella = clean_h2
+            elif p_no > 30:
+                active_umbrella = None
+
+        curr_h: str | None = None
+        curr_lvl = 0
+        curr_lines: list[str] = []
+
+        for l in lines:
+            m = re.match(r"^(#{2,4})\s+(.+)$", l)
+            if m:
+                if curr_h is not None:
+                    blocks.append(
+                        {
+                            "page": p_no,
+                            "level": curr_lvl,
+                            "heading": curr_h,
+                            "parent_umbrella": active_umbrella,
+                            "lines": curr_lines,
+                        }
+                    )
+                curr_lvl = len(m.group(1))
+                curr_h = m.group(2).strip()
+                curr_lines = []
+            else:
+                if curr_h is not None:
+                    curr_lines.append(l)
+
+        if curr_h is not None:
+            blocks.append(
+                {
+                    "page": p_no,
+                    "level": curr_lvl,
+                    "heading": curr_h,
+                    "parent_umbrella": active_umbrella,
+                    "lines": curr_lines,
+                }
+            )
+
+    # Identify which H2 headings act as umbrella programs over subordinate entities
+    umbrella_names = {"تعزيز الصحة والوقاية", "البرامج الميدانية", "العلاج الخيري", "معهد زمزم المعرفي للتدريب"}
+    for b in blocks:
+        for l in b["lines"]:
+            m_parent = re.search(r"يتبع\s+برنامج\s*[:：]\s*(.+)$", l)
+            if m_parent:
+                umbrella_names.add(m_parent.group(1).strip().rstrip("."))
+
+    extracted: list[dict[str, Any]] = []
+
+    for b in blocks:
+        raw_h = b["heading"]
+        if is_non_entity_heading(raw_h) or "الأنشطة" in raw_h or "(تابع)" in raw_h:
+            continue
+
+        blines = b["lines"]
+        if not blines:
+            continue
+
+        btext = "\n".join(blines).translate(AR_DIGITS)
+
+        # Must contain at least one substantive program/project indicator (beneficiaries, description, budget, SROI, project status, or code)
+        has_evidence = any(
+            k in btext
+            for k in (
+                "عدد المستفيدين",
+                "الوصف:",
+                "وصف البرنامج:",
+                "وصف المشروع:",
+                "إجمالي الإنفاق",
+                "الميزانية:",
+                "إجمالي ميزانية",
+                "القيمة الإجمالية:",
+                "العائد المجتمعي على الاستثمار",
+                "حالة المشروع:",
+                "التصنيف:",
+                "عدد البرامج التدريبية:",
+            )
+        )
+        if not has_evidence:
+            continue
+
+        # Parse explicit attributes from bullet lines
+        explicit_type: str | None = None
+        code: str | None = None
+        desc_val: str | None = None
+        delivery_val: str | None = None
+        target_val: str | None = None
+        benef_val: int | None = None
+        budget_val: int | float | None = None
+        value_val: str | None = None
+        extra_notes: list[str] = [f"المصدر: ص {b['page']}"]
+
+        # Check heading prefix (`البرنامج: ...` / `المشروع: ...`)
+        clean_name = raw_h
+        m_hpref = re.match(r"^(البرنامج|برنامج|المشروع|مشروع)\s*[:：]\s*(.+)$", raw_h)
+        if m_hpref:
+            explicit_type = "program" if "برنامج" in m_hpref.group(1) else "project"
+            clean_name = m_hpref.group(2).strip()
+
+        in_disbursement_section = False
+        for l in blines:
+            l_clean = re.sub(r"^[-*•]\s*", "", l).strip()
+            l_ar = l_clean.translate(AR_DIGITS)
+
+            if "حركة الصرف" in l_ar:
+                in_disbursement_section = True
+                continue
+            if "حركة الإيراد" in l_ar:
+                in_disbursement_section = False
+                continue
+
+            # Explicit type
+            m_type = re.match(r"^التصنيف\s*[:：]\s*(.+)$", l_ar)
+            if m_type:
+                t_str = m_type.group(1).strip()
+                explicit_type = "program" if "برنامج" in t_str else "project"
+                continue
+
+            # Explicit code
+            m_code = re.match(r"^رمز\s+(?:البرنامج|المشروع)\s*[:：]\s*(.+)$", l_ar)
+            if m_code:
+                code = m_code.group(1).strip()
+                extra_notes.append(f"الرمز: {code}")
+                continue
+
+            # Parent program reference
+            m_parent = re.match(r"^يتبع\s+برنامج\s*[:：]\s*(.+)$", l_ar)
+            if m_parent:
+                extra_notes.append(f"البرنامج المظلة: {m_parent.group(1).strip()}")
+                explicit_type = "project"
+                continue
+
+            # Beneficiaries count
+            m_ben = re.search(r"عدد\s+المستفيدين(?:\s+المستهدفين)?\s*[:：]\s*[*_]*([\d,]+)", l_ar)
+            if m_ben:
+                num = to_number(m_ben.group(1))
+                if isinstance(num, int):
+                    benef_val = num
+                continue
+
+            # Budget / Expenditure
+            m_bud = re.search(
+                r"(?:إجمالي\s+الإنفاق(?:\s+المالي)?|إجمالي\s+ميزانية\s+البرنامج|الميزانية)\s*[:：]\s*[*_]*([\d,]+(?:\.\d+)?)",
+                l_ar,
+            )
+            if m_bud:
+                budget_val = to_number(m_bud.group(1))
+                continue
+
+            # In multi-section cards like `جهازك حياة`, prefer `حركة الصرف` value as the expenditure budget, and note revenue in notes
+            m_val = re.search(r"القيمة\s+الإجمالية\s*[:：]\s*[*_]*([\d,]+(?:\.\d+)?)", l_ar)
+            if m_val:
+                v_num = to_number(m_val.group(1))
+                if in_disbursement_section or budget_val is None:
+                    if in_disbursement_section and budget_val is not None:
+                        extra_notes.append(f"قيمة الإيرادات العينية المستلمة: {budget_val:,} ريال")
+                    budget_val = v_num
+                continue
+
+            # Description
+            m_desc = re.match(r"^(?:الوصف|وصف\s+البرنامج|وصف\s+المشروع)\s*[:：]\s*(.+)$", l_clean)
+            if m_desc:
+                desc_val = m_desc.group(1).strip()
+                continue
+
+            # Delivery method
+            m_deliv = re.match(r"^(?:طريقة\s+التنفيذ|آلية\s+التنفيذ)\s*[:：]\s*(.+)$", l_clean)
+            if m_deliv:
+                delivery_val = m_deliv.group(1).strip()
+                continue
+
+            # Target audience
+            m_targ = re.match(r"^(?:الفئة\s+المستهدفة|الفئات\s+المستهدفة)\s*[:：]\s*(.+)$", l_clean)
+            if m_targ:
+                target_val = m_targ.group(1).strip().rstrip(".")
+                continue
+
+            # SROI line
+            if "العائد المجتمعي على الاستثمار" in l_clean:
+                sroi_clean = re.sub(r"\*+", "", l_clean).rstrip(".")
+                desc_val = f"أظهرت دراسة العائد المجتمعي على الاستثمار (SROI) أن {sroi_clean}."
+                value_val = sroi_clean
+                extra_notes.append("ورد ضمن قسم دراسات العائد المجتمعي على الاستثمار (SROI)")
+                continue
+
+            # Government donation platform projects (`مشروع دعمهم يبصرون`, `مشروع فرحة عاجز`)
+            m_stat = re.match(r"^حالة\s+المشروع\s*[:：]\s*(.+)$", l_clean)
+            if m_stat:
+                st = m_stat.group(1).strip().rstrip(".")
+                desc_val = f"مشروع مدرج في منصات التبرع الحكومية (حالة المشروع: {st})."
+                extra_notes.append(f"حالة المشروع في منصات التبرع الحكومية: {st}")
+                continue
+
+            m_unlabeled_num = re.match(r"^الرقم\s+الظاهر\s+بجوار\s+المشروع.*[:：]\s*[*_]*([\d,]+)", l_ar)
+            if m_unlabeled_num:
+                # Do NOT assign an unlabeled platform number to budget or beneficiaries_count; record in notes
+                extra_notes.append(f"الرقم الظاهر بجوار المشروع في التقرير: {m_unlabeled_num.group(1)} (غير محدد كتكلفة أو مستفيدين)")
+                continue
+
+            # Other quantitative facts (e.g. number of rounds, convoys, training programs, devices)
+            if l_clean and not l_clean.startswith("#"):
+                extra_notes.append(re.sub(r"\*+", "", l_clean).rstrip("."))
+
+        # Classify program vs project based on hierarchy and name
+        is_umbrella = clean_name in umbrella_names
+        is_sub = (
+            not is_umbrella
+            and (
+                b["level"] >= 3
+                or (b["parent_umbrella"] in ("تعزيز الصحة والوقاية", "البرامج الميدانية") and b["page"] <= 30)
+            )
+        )
+        if b["parent_umbrella"] and is_sub and f"البرنامج المظلة: {b['parent_umbrella']}" not in extra_notes:
+            extra_notes.insert(1, f"يتبع: {b['parent_umbrella']} (للاسترشاد؛ مستفيدو الأنشطة الفرعية مشمولون ضمن إجمالي البرنامج المظلة لمنع الازدواج)")
+
+        if is_umbrella and clean_name in ("تعزيز الصحة والوقاية", "البرامج الميدانية"):
+            extra_notes.append("تنبيه: إجمالي المستفيدين لهذا البرنامج المظلة يشمل مستفيدي الأنشطة والمشاريع الفرعية التابعة له، لذا يجب عدم جمعهم مرتين")
+
+        ent_type = explicit_type or infer_entity_type_from_name_and_context(
+            name=clean_name,
+            raw_type=None,
+            code=code,
+            is_sub_activity=is_sub,
+            has_children=is_umbrella,
+        )
+
+        # Synthesize description if not explicitly labeled with `الوصف:`
+        if not desc_val:
+            if clean_name == "العلاج الخيري":
+                desc_val = "برنامج لتقديم خدمات العلاج الخيري للمرضى المحتاجين شاملة الأدوية والعمليات الجراحية والكشف المخفض والمستلزمات الطبية."
+                delivery_val = "استقبال طلبات العلاج عبر البوابة الإلكترونية وتوجيه الحالات لمزودي الخدمات الصحية."
+                value_val = "تغطية تكاليف العلاج والعمليات والأدوية للمرضى المحتاجين."
+            elif clean_name == "جهازك حياة":
+                desc_val = "مشروع لاستقبال الأجهزة والمستلزمات الطبية من المتبرعين وصرفها للمرضى المحتاجين والجهات المستفيدة."
+                delivery_val = "استلام الأجهزة الطبية المتبرع بها وفحصها وتوزيعها على المرضى والجهات الصحية."
+                value_val = "توفير الأجهزة والمستلزمات الطبية للمرضى المحتاجين."
+            elif clean_name == "تعزيز الصحة والوقاية":
+                desc_val = "برنامج مظلة لتعزيز الصحة والوقاية ورفع الوعي الصحي للمستفيدين والمجتمع عبر حزمة من الأنشطة والمبادرات التوعوية والميدانية."
+                delivery_val = "تنفيذ أنشطة التثقيف الصحي، قياس العلامات الحيوية، الاستشارات الطبية، والعيادات الافتراضية."
+            elif clean_name == "البرامج الميدانية":
+                desc_val = "برنامج مظلة لتقديم الرعاية الصحية الميدانية عبر الجولات والقوافل الطبية والعيادات المتنقلة والموسمية."
+                delivery_val = "تسيير 30 جولة طبية بين جدة ومكة والطائف و7 قوافل طبية وتشغيل العيادات الميدانية."
+            elif clean_name == "معهد زمزم المعرفي للتدريب":
+                desc_val = "تنفيذ برامج وساعات تدريبية لتطوير القدرات ونقل المعرفة بالتعاون مع الجهات المساهمة."
+                delivery_val = "تقديم 91 برنامجًا تدريبيًا بإجمالي 5,565 ساعة تدريبية."
+
+        desc_val, delivery_val, val_from_desc, targ_from_desc = _split_description_and_delivery(desc_val, delivery_val)
+        if not value_val and val_from_desc:
+            value_val = val_from_desc
+        if not target_val and targ_from_desc:
+            target_val = targ_from_desc
+
+        candidate = {
+            "type": ent_type,
+            "name": clean_name,
+            "year": year,
+            "description": desc_val,
+            "beneficiaries_count": benef_val,
+            "budget": budget_val,
+            "beneficiary_value": value_val,
+            "target_audience": target_val,
+            "delivery_method": delivery_val,
+            "notes": "؛ ".join(extra_notes) if extra_notes else None,
+            "_code": code,
+            "_is_sub_activity": is_sub,
+            "_has_children": is_umbrella,
+        }
+        validated = validate_entity_schema(candidate, default_year=year)
+        if validated:
+            extracted.append(validated)
+
+    return extracted
+
+
+def _collect_verbatim_document_headings(pages: list[tuple[int, str]]) -> list[str]:
+    """Collect verbatim headings from the document to snap near-miss LLM name substitutions
+    (such as `تأهيل الصحة عبر وسائل التواصل الاجتماعي` -> `تعزيز الصحة عبر وسائل التواصل الاجتماعي`).
+    """
+    headings: list[str] = []
+    for _, body in pages:
+        for line in (body or "").splitlines():
+            s = line.strip()
+            m = re.match(r"^#{1,4}\s+(.+)$", s)
+            if m:
+                h = re.sub(r"^(?:البرنامج|برنامج|المشروع|مشروع)\s*[:：]\s*", "", m.group(1).strip()).strip()
+                if h and not is_non_entity_heading(h) and h not in headings:
+                    headings.append(h)
+    return headings
+
+
+def snap_name_to_document_heading(name: str, verbatim_headings: list[str]) -> tuple[str, bool]:
+    """If `name` is not verbatim in the document headings, check if a verbatim heading shares
+    high token/character overlap (e.g. only 1 word altered by the LLM) and snap to the verbatim heading.
+    """
+    if not name or not verbatim_headings:
+        return name, False
+    if name in verbatim_headings:
+        return name, False
+
+    n_norm = norm(name)
+    for vh in verbatim_headings:
+        if norm(vh) == n_norm:
+            return vh, (vh != name)
+
+    # Check high similarity (>= 0.80 SequenceMatcher or >= 75% shared tokens on multi-word headings)
+    n_tokens = norm(name).split()
+    best_vh = None
+    best_score = 0.0
+    for vh in verbatim_headings:
+        vh_tokens = norm(vh).split()
+        seq_ratio = SequenceMatcher(None, norm(name), norm(vh)).ratio()
+        if len(n_tokens) >= 3 and len(vh_tokens) == len(n_tokens):
+            shared = sum(1 for a, b in zip(n_tokens, vh_tokens) if a == b)
+            tok_ratio = shared / len(n_tokens)
+            if tok_ratio >= 0.75 and seq_ratio >= 0.78 and seq_ratio > best_score:
+                best_score = seq_ratio
+                best_vh = vh
+        elif seq_ratio >= 0.86 and seq_ratio > best_score:
+            best_score = seq_ratio
+            best_vh = vh
+
+    if best_vh:
+        return best_vh, True
+    return name, False
+
+
 def enrich_and_reconcile_entities(
     model_entities: list[dict[str, Any]],
     pages: list[tuple[int, str]],
     default_year: int | None = None,
+    review: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Combine model-extracted entities with deterministic structural card evidence:
-      1. If structured cards exist on the pages, enrich `description` (which the legacy model
-         was trained to set to `null`) and any missing fields from the card evidence.
-      2. Ensure no genuine program or project card in the document is missed if a chunk truncated.
-      3. Filter out non-entity administrative/budget-summary/goal headings.
-      4. Deduplicate entities across chunks and attachments while preserving distinct entities.
+    """Combine model-extracted entities with deterministic structural cards AND Markdown section evidence:
+      1. Snap altered LLM entity names back to verbatim source headings.
+      2. Reconcile against deterministic structural cards (for operational plan decks) or
+         deterministic Markdown report sections (for structured annual reports).
+      3. Ensure `description` and `delivery_method` are never blindly duplicated.
+      4. Ensure explicitly labeled `beneficiaries_count` values are preserved and missing sections are recovered.
     """
+    if review is None:
+        review = []
+
     structural_cards = extract_structured_cards(pages, default_year=default_year)
+    md_sections = extract_markdown_report_sections(pages, default_year=default_year) if not structural_cards else []
+    reference_entities = structural_cards or md_sections
+
     full_doc_text = "\n\n".join(body for _, body in pages)
     full_doc_norm = norm(full_doc_text)
-
-    # Index structural cards by normalized core name
-    structural_by_name: list[dict[str, Any]] = list(structural_cards)
+    verbatim_headings = _collect_verbatim_document_headings(pages)
 
     reconciled: list[dict[str, Any]] = []
-    used_structural_indices: set[int] = set()
+    used_ref_indices: set[int] = set()
 
     for item in model_entities:
+        if not isinstance(item, dict):
+            continue
+        raw_name = str(item.get("name") or "").strip()
+        snapped_name, was_snapped = snap_name_to_document_heading(raw_name, verbatim_headings)
+        if was_snapped:
+            review.append({"name": snapped_name, "reason": f"تم تصحيح الاسم من '{raw_name}' لمطابقة النص الأصلي"})
+            item = dict(item, name=snapped_name)
+
         validated = validate_entity_schema(item, default_year=default_year)
         if not validated:
             continue
+
         # Ground numbers against full document
         for num_field in ("beneficiaries_count", "budget"):
             if validated[num_field] is not None and not number_in_text(validated[num_field], full_doc_norm):
+                review.append({"name": validated["name"], "reason": f"{num_field} غير مكتوب في النص - اتحوّل null"})
                 validated[num_field] = None
+
         if validated["beneficiaries_count"] is not None and is_kpi_quantity_not_beneficiaries(
-            validated["beneficiaries_count"], full_doc_text
+            validated["beneficiaries_count"],
+            full_doc_text,
+            entity_name=validated["name"],
         ):
+            review.append(
+                {
+                    "name": validated["name"],
+                    "reason": f"الرقم {validated['beneficiaries_count']} مؤشر أداء/كمية مستهدفة وليس عدد المستفيدين - اتحوّل null",
+                }
+            )
             validated["beneficiaries_count"] = None
 
-        # Match against structural card if available
+        # Match against deterministic reference entity (structural card or markdown section)
         matched_idx = None
-        for idx, sc in enumerate(structural_by_name):
-            if name_score(validated["name"], sc["name"]) >= 0.88:
+        for idx, ref_ent in enumerate(reference_entities):
+            if name_score(validated["name"], ref_ent["name"]) >= 0.85:
                 matched_idx = idx
                 break
 
         if matched_idx is not None:
-            used_structural_indices.add(matched_idx)
-            sc = structural_by_name[matched_idx]
-            # Structural card code is authoritative for program vs project classification and budget
-            validated["type"] = sc["type"]
-            validated["name"] = sc["name"]
-            if sc.get("budget") is not None:
-                validated["budget"] = sc["budget"]
-            for field in ("year", "description", "beneficiary_value", "target_audience", "delivery_method", "notes"):
-                if sc.get(field) not in (None, ""):
-                    validated[field] = sc[field]
+            used_ref_indices.add(matched_idx)
+            ref_ent = reference_entities[matched_idx]
+            if validated["type"] != ref_ent["type"]:
+                review.append(
+                    {
+                        "name": ref_ent["name"],
+                        "reason": f"تم تصحيح التصنيف من {validated['type']} إلى {ref_ent['type']} وفق هيكل المستند",
+                    }
+                )
+            validated["type"] = ref_ent["type"]
+            validated["name"] = ref_ent["name"]
+            for num_k in ("budget", "beneficiaries_count"):
+                if ref_ent.get(num_k) is not None:
+                    validated[num_k] = ref_ent[num_k]
+            for str_k in ("year", "description", "beneficiary_value", "target_audience", "delivery_method", "notes"):
+                if ref_ent.get(str_k) not in (None, ""):
+                    validated[str_k] = ref_ent[str_k]
         else:
-            # For free-form documents without structural cards, if description is null (due to legacy model prompt)
-            # synthesize a conservative evidence-based description from delivery_method + beneficiary_value if available
-            if validated["description"] is None:
-                dm = validated.get("delivery_method")
-                bv = validated.get("beneficiary_value")
-                if dm and bv and dm != bv:
-                    validated["description"] = f"{dm.rstrip('.')}، بهدف {bv}"
-                elif dm:
-                    validated["description"] = dm
-                elif bv:
-                    validated["description"] = bv
+            # For free-form narrative entities without a deterministic card/section, avoid duplicating delivery_method == description
+            desc, deliv, val_ext, targ_ext = _split_description_and_delivery(
+                validated.get("description"),
+                validated.get("delivery_method"),
+            )
+            validated["description"] = desc
+            validated["delivery_method"] = deliv
+            if not validated.get("beneficiary_value") and val_ext:
+                validated["beneficiary_value"] = val_ext
+            if not validated.get("target_audience") and targ_ext:
+                validated["target_audience"] = targ_ext
 
         reconciled.append(validated)
 
-    # Add any structural cards that the model missed or that were in a chunk not run in deterministic/hybrid mode
-    for idx, sc in enumerate(structural_by_name):
-        if idx not in used_structural_indices:
-            reconciled.append(dict(sc))
+    # Add any deterministic card or markdown section that the model missed
+    for idx, ref_ent in enumerate(reference_entities):
+        if idx not in used_ref_indices:
+            if model_entities:
+                review.append(
+                    {
+                        "name": ref_ent["name"],
+                        "reason": "تم استرجاع العنصر آليًا من هيكل المستند بعد إغفاله في التوليد النصي",
+                    }
+                )
+            reconciled.append(dict(ref_ent))
 
-    # Final deduplication pass preserving order (programs first, then projects in document order)
+    # Final deduplication pass preserving order
     deduped: list[dict[str, Any]] = []
     for ent in reconciled:
         duplicate_found = False
@@ -1161,16 +1721,27 @@ def build_contract_response(
     json_repaired: bool = False,
     needs_attention: bool = False,
 ) -> dict[str, Any]:
-    """Build a unified JSON response object that satisfies:
-      1. The golden contract schema (`programs` and `projects` arrays, each item having exact 10 fields).
-      2. The single-entity `StoreProgramRequest::rules()` top-level 10-field autofill preview (populated from
-         the primary extracted entity so a single-form frontend consumer works immediately without breaking).
-      3. The legacy `result.programs_and_projects` structure for backward compatibility with existing n8n nodes.
+    """Build a unified JSON response object satisfying both the multi-entity golden contract
+    (`programs` + `projects`) and single-entity autofill (`StoreProgramRequest::rules()`).
     """
     programs, projects = split_programs_and_projects(entities)
     all_items = programs + projects
+    review_list = review or []
 
-    # Primary entity for single-form autofill compatibility (`StoreProgramRequest::rules()`)
+    # Flag needs_attention if any chunk had parse/truncation errors, JSON required repair,
+    # no entities were extracted, or review flags indicate corrections/missing data.
+    attention_flag = bool(
+        needs_attention
+        or json_repaired
+        or not all_items
+        or any(
+            "اتحوّل null" in r.get("reason", "")
+            or "إغفاله" in r.get("reason", "")
+            or "تصحيح" in r.get("reason", "")
+            for r in review_list
+        )
+    )
+
     primary: dict[str, Any] = (
         dict(all_items[0])
         if all_items
@@ -1189,13 +1760,10 @@ def build_contract_response(
     )
 
     response: dict[str, Any] = {
-        # Top-level 10 fields for direct single-program autofill compatibility
         **{k: primary.get(k) for k in FIELDS},
-        # Golden reference contract arrays (9 programs + 24 projects = 33 entities on Athar 2027)
         "programs": programs,
         "projects": projects,
         "programs_and_projects": all_items,
-        # Legacy wrapper & metadata for n8n / backend audit
         "result": {
             "association_name": association_name,
             "year": year,
@@ -1211,11 +1779,11 @@ def build_contract_response(
             "association_name": association_name,
             "year": year,
         },
-        "review": review or [],
+        "review": review_list,
         "chunks": chunks_info or [],
         "sources": sources or [],
         "json_repaired": json_repaired,
-        "needs_attention": needs_attention,
+        "needs_attention": attention_flag,
     }
     if run_id is not None:
         response["run_id"] = str(run_id)
