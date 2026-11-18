@@ -24,7 +24,7 @@ jobs:
       - name: Run Ruff linter
         run: ruff check config.py ingestion.py postprocess.py handler.py tests/
       - name: Run unit and golden benchmark tests (CPU / no GPU required)
-        run: pytest -v -m "not gpu"
+        run: python -m pytest -v -m "not gpu"
 
   build:
     needs: test-and-lint
