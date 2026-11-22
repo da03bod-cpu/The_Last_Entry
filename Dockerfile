@@ -25,6 +25,6 @@ RUN python -m pip uninstall -y torchvision torchaudio
 COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
-COPY config.py ingestion.py postprocess.py handler.py ./
+COPY config.py ingestion.py postprocess.py streaming.py handler.py ./
 
 CMD ["python", "-u", "handler.py"]

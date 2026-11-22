@@ -2,7 +2,7 @@ name: build-worker-image
 on:
   push:
     branches: [main, "feat/**"]
-    paths: ["Dockerfile", "config.py", "ingestion.py", "handler.py", "postprocess.py", "requirements.txt", "tests/**", ".github/workflows/build.yml"]
+    paths: ["Dockerfile", "config.py", "ingestion.py", "handler.py", "postprocess.py", "streaming.py", "requirements.txt", "tests/**", ".github/workflows/build.yml"]
   pull_request:
     branches: [main]
   workflow_dispatch: {}
@@ -20,9 +20,9 @@ jobs:
       - name: Install unit test and lint dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ruff pytest json-repair pymupdf openpyxl python-docx Pillow pytesseract
+          python -m pip install ruff pytest "runpod>=1.7.0" json-repair pymupdf openpyxl python-docx Pillow pytesseract
       - name: Run Ruff linter
-        run: ruff check config.py ingestion.py postprocess.py handler.py tests/
+        run: ruff check config.py ingestion.py postprocess.py streaming.py handler.py tests/
       - name: Run unit and golden benchmark tests (CPU / no GPU required)
         run: python -m pytest -v -m "not gpu"
 

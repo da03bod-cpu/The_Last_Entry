@@ -43,6 +43,13 @@ SKIP_LLM_FOR_STRUCTURED_CARD_PAGES = (
     os.getenv("SKIP_LLM_FOR_STRUCTURED_CARD_PAGES", "1").strip().lower() not in ("0", "false", "no")
 )
 
+# Progressive streaming settings (RunPod Serverless generator handler)
+STREAM_SCHEMA_VERSION = "1.0"
+RUNPOD_ENABLE_STREAMING = os.getenv("RUNPOD_ENABLE_STREAMING", "1").strip().lower() not in ("0", "false", "no")
+RETURN_AGGREGATE_STREAM = os.getenv("RETURN_AGGREGATE_STREAM", "1").strip().lower() not in ("0", "false", "no")
+STREAM_EMIT_PROGRESS = os.getenv("STREAM_EMIT_PROGRESS", "1").strip().lower() not in ("0", "false", "no")
+STREAM_DEADLINE_BUFFER_SECONDS = int(os.getenv("STREAM_DEADLINE_BUFFER_SECONDS", "15"))
+
 # Must match SYSTEM_PROMPT in train_v3.py (overridden automatically if adapter contains system_prompt.txt)
 SYSTEM_PROMPT = (
     "أنت نموذج متخصص في استخراج البرامج والمشاريع والمبادرات والفعاليات الرئيسية من التقارير السنوية "

@@ -24,6 +24,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from collections.abc import Iterator
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -470,6 +471,10 @@ def infer_entity_type_from_name_and_context(
         return "project"
     if re.match(r"^(?:البرنامج|برنامج|معهد)\b", n_strip):
         return "program"
+    if re.match(r"^project\b", n_strip, re.IGNORECASE):
+        return "project"
+    if re.match(r"^program(?:me)?\b", n_strip, re.IGNORECASE):
+        return "program"
 
     if has_children:
         return "program"
@@ -477,7 +482,7 @@ def infer_entity_type_from_name_and_context(
         return "project"
 
     rt = str(raw_type or "").strip().lower()
-    if rt in ("program", "برنامج"):
+    if rt in ("program", "programme", "برنامج"):
         return "program"
     return "project"
 
@@ -488,14 +493,17 @@ def validate_entity_schema(entity: dict[str, Any], default_year: int | None = No
         return None
 
     raw_name = str(entity.get("name") or "").strip()
-    # Strip markdown heading markers or leading prefixes like "البرنامج: " / "المشروع: " if present
+    # Strip markdown heading markers or leading prefixes like "البرنامج: " / "المشروع: " / "Program: " / "Project: "
     raw_name = re.sub(r"^#{1,6}\s*", "", raw_name).strip()
     explicit_prefix_type = None
-    m_pref = re.match(r"^(?:البرنامج|برنامج|المشروع|مشروع)\s*[:：]\s*(.+)$", raw_name)
+    m_pref = re.match(
+        r"^(?:(البرنامج|برنامج|program|programme)|(المشروع|مشروع|project))\s*[:：]\s*(.+)$",
+        raw_name,
+        re.IGNORECASE,
+    )
     if m_pref:
-        prefix_word = raw_name.split(":", 1)[0].split("：", 1)[0].strip()
-        explicit_prefix_type = "program" if "برنامج" in prefix_word else "project"
-        raw_name = m_pref.group(1).strip()
+        explicit_prefix_type = "program" if m_pref.group(1) else "project"
+        raw_name = m_pref.group(3).strip()
 
     if not raw_name or is_non_entity_heading(raw_name):
         return None
@@ -1063,13 +1071,16 @@ def _build_grounded_notes(
     return "؛ ".join(parts)
 
 
-def extract_structured_cards(pages: list[tuple[int, str]], default_year: int | None = None) -> list[dict[str, Any]]:
-    """Deterministically extract numbered program/project cards from operational plans."""
+def iter_structured_cards(
+    pages: list[tuple[int, str]],
+    default_year: int | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Lazily extract and yield numbered program/project cards one by one as pages are scanned."""
     doc_meta = detect_document_metadata(pages)
     year = default_year or doc_meta.get("year")
 
-    cards_by_code: dict[str, dict[str, Any]] = {}
-    ordered_codes: list[str] = []
+    active_card: dict[str, Any] | None = None
+    emitted_codes: set[str] = set()
 
     for p_no, body in pages:
         lines = [l.strip() for l in (body or "").splitlines() if l.strip()]
@@ -1107,30 +1118,38 @@ def extract_structured_cards(pages: list[tuple[int, str]], default_year: int | N
                         budget = val
                         break
 
-            cards_by_code[code] = {
-                "code": code,
-                "type": ent_type,
-                "name": name,
-                "year": year,
-                "budget": budget,
-                "pages": [p_no],
-                "lines": list(lines),
-            }
-            if code not in ordered_codes:
-                ordered_codes.append(code)
-        elif is_cont and code in cards_by_code:
-            cards_by_code[code]["pages"].append(p_no)
-            cards_by_code[code]["lines"].extend(lines)
+            if active_card is not None and active_card["code"] != code:
+                synthesized = _synthesize_card_fields(active_card, doc_meta)
+                validated = validate_entity_schema(synthesized, default_year=year)
+                if validated:
+                    yield validated
+                emitted_codes.add(active_card["code"])
+                active_card = None
 
-    extracted: list[dict[str, Any]] = []
-    for code in ordered_codes:
-        card = cards_by_code[code]
-        synthesized = _synthesize_card_fields(card, doc_meta)
+            if code not in emitted_codes:
+                active_card = {
+                    "code": code,
+                    "type": ent_type,
+                    "name": name,
+                    "year": year,
+                    "budget": budget,
+                    "pages": [p_no],
+                    "lines": list(lines),
+                }
+        elif is_cont and active_card is not None and active_card["code"] == code:
+            active_card["pages"].append(p_no)
+            active_card["lines"].extend(lines)
+
+    if active_card is not None:
+        synthesized = _synthesize_card_fields(active_card, doc_meta)
         validated = validate_entity_schema(synthesized, default_year=year)
         if validated:
-            extracted.append(validated)
+            yield validated
 
-    return extracted
+
+def extract_structured_cards(pages: list[tuple[int, str]], default_year: int | None = None) -> list[dict[str, Any]]:
+    """Deterministically extract numbered program/project cards from operational plans."""
+    return list(iter_structured_cards(pages, default_year=default_year))
 
 
 def _split_description_and_delivery(
@@ -1188,29 +1207,241 @@ def _split_description_and_delivery(
     return final_desc, final_delivery, value_extracted, target_extracted
 
 
-def extract_markdown_report_sections(
+def _parse_markdown_report_block(
+    block: dict[str, Any],
+    year: int | None,
+    umbrella_names: set[str],
+) -> dict[str, Any] | None:
+    """Parse and validate one Markdown heading block into an entity dict (or None)."""
+    raw_h = block["heading"]
+    if is_non_entity_heading(raw_h) or "الأنشطة" in raw_h or "(تابع)" in raw_h:
+        return None
+
+    blines = block["lines"]
+    if not blines:
+        return None
+
+    btext = "\n".join(blines).translate(AR_DIGITS)
+
+    # Must contain at least one substantive program/project indicator
+    has_evidence = any(
+        k in btext
+        for k in (
+            "عدد المستفيدين",
+            "الوصف:",
+            "وصف البرنامج:",
+            "وصف المشروع:",
+            "إجمالي الإنفاق",
+            "الميزانية:",
+            "إجمالي ميزانية",
+            "القيمة الإجمالية:",
+            "العائد المجتمعي على الاستثمار",
+            "حالة المشروع:",
+            "التصنيف:",
+            "عدد البرامج التدريبية:",
+        )
+    )
+    if not has_evidence:
+        return None
+
+    explicit_type: str | None = None
+    code: str | None = None
+    desc_val: str | None = None
+    delivery_val: str | None = None
+    target_val: str | None = None
+    benef_val: int | None = None
+    budget_val: int | float | None = None
+    value_val: str | None = None
+    extra_notes: list[str] = [f"المصدر: ص {block['page']}"]
+
+    clean_name = raw_h
+    m_hpref = re.match(
+        r"^(?:(البرنامج|برنامج|program|programme)|(المشروع|مشروع|project))\s*[:：]\s*(.+)$",
+        raw_h,
+        re.IGNORECASE,
+    )
+    if m_hpref:
+        explicit_type = "program" if m_hpref.group(1) else "project"
+        clean_name = m_hpref.group(3).strip()
+
+    in_disbursement_section = False
+    for l in blines:
+        l_clean = re.sub(r"^[-*•]\s*", "", l).strip()
+        l_ar = l_clean.translate(AR_DIGITS)
+
+        if "حركة الصرف" in l_ar:
+            in_disbursement_section = True
+            continue
+        if "حركة الإيراد" in l_ar:
+            in_disbursement_section = False
+            continue
+
+        m_type = re.match(r"^التصنيف\s*[:：]\s*(.+)$", l_ar)
+        if m_type:
+            t_str = m_type.group(1).strip()
+            explicit_type = "program" if "برنامج" in t_str else "project"
+            continue
+
+        m_code = re.match(r"^رمز\s+(?:البرنامج|المشروع)\s*[:：]\s*(.+)$", l_ar)
+        if m_code:
+            code = m_code.group(1).strip()
+            extra_notes.append(f"الرمز: {code}")
+            continue
+
+        m_parent = re.match(r"^يتبع\s+برنامج\s*[:：]\s*(.+)$", l_ar)
+        if m_parent:
+            extra_notes.append(f"البرنامج المظلة: {m_parent.group(1).strip()}")
+            explicit_type = "project"
+            continue
+
+        m_ben = re.search(r"عدد\s+المستفيدين(?:\s+المستهدفين)?\s*[:：]\s*[*_]*([\d,]+)", l_ar)
+        if m_ben:
+            num = to_number(m_ben.group(1))
+            if isinstance(num, int):
+                benef_val = num
+            continue
+
+        m_bud = re.search(
+            r"(?:إجمالي\s+الإنفاق(?:\s+المالي)?|إجمالي\s+ميزانية\s+البرنامج|الميزانية)\s*[:：]\s*[*_]*([\d,]+(?:\.\d+)?)",
+            l_ar,
+        )
+        if m_bud:
+            budget_val = to_number(m_bud.group(1))
+            continue
+
+        m_val = re.search(r"القيمة\s+الإجمالية\s*[:：]\s*[*_]*([\d,]+(?:\.\d+)?)", l_ar)
+        if m_val:
+            v_num = to_number(m_val.group(1))
+            if in_disbursement_section or budget_val is None:
+                if in_disbursement_section and budget_val is not None:
+                    extra_notes.append(f"قيمة الإيرادات العينية المستلمة: {budget_val:,} ريال")
+                budget_val = v_num
+            continue
+
+        m_desc = re.match(r"^(?:الوصف|وصف\s+البرنامج|وصف\s+المشروع)\s*[:：]\s*(.+)$", l_clean)
+        if m_desc:
+            desc_val = m_desc.group(1).strip()
+            continue
+
+        m_deliv = re.match(r"^(?:طريقة\s+التنفيذ|آلية\s+التنفيذ)\s*[:：]\s*(.+)$", l_clean)
+        if m_deliv:
+            delivery_val = m_deliv.group(1).strip()
+            continue
+
+        m_targ = re.match(r"^(?:الفئة\s+المستهدفة|الفئات\s+المستهدفة)\s*[:：]\s*(.+)$", l_clean)
+        if m_targ:
+            target_val = m_targ.group(1).strip().rstrip(".")
+            continue
+
+        if "العائد المجتمعي على الاستثمار" in l_clean:
+            sroi_clean = re.sub(r"\*+", "", l_clean).rstrip(".")
+            desc_val = f"أظهرت دراسة العائد المجتمعي على الاستثمار (SROI) أن {sroi_clean}."
+            value_val = sroi_clean
+            extra_notes.append("ورد ضمن قسم دراسات العائد المجتمعي على الاستثمار (SROI)")
+            continue
+
+        m_stat = re.match(r"^حالة\s+المشروع\s*[:：]\s*(.+)$", l_clean)
+        if m_stat:
+            st = m_stat.group(1).strip().rstrip(".")
+            desc_val = f"مشروع مدرج في منصات التبرع الحكومية (حالة المشروع: {st})."
+            extra_notes.append(f"حالة المشروع في منصات التبرع الحكومية: {st}")
+            continue
+
+        m_unlabeled_num = re.match(r"^الرقم\s+الظاهر\s+بجوار\s+المشروع.*[:：]\s*[*_]*([\d,]+)", l_ar)
+        if m_unlabeled_num:
+            extra_notes.append(
+                f"الرقم الظاهر بجوار المشروع في التقرير: {m_unlabeled_num.group(1)} (غير محدد كتكلفة أو مستفيدين)"
+            )
+            continue
+
+        if l_clean and not l_clean.startswith("#"):
+            extra_notes.append(re.sub(r"\*+", "", l_clean).rstrip("."))
+
+    is_umbrella = clean_name in umbrella_names
+    is_sub = not is_umbrella and (
+        block["level"] >= 3
+        or (block["parent_umbrella"] in ("تعزيز الصحة والوقاية", "البرامج الميدانية") and block["page"] <= 30)
+    )
+    if block["parent_umbrella"] and is_sub and f"البرنامج المظلة: {block['parent_umbrella']}" not in extra_notes:
+        extra_notes.insert(
+            1,
+            f"يتبع: {block['parent_umbrella']} (للاسترشاد؛ مستفيدو الأنشطة الفرعية مشمولون ضمن إجمالي البرنامج المظلة لمنع الازدواج)",
+        )
+
+    if is_umbrella and clean_name in ("تعزيز الصحة والوقاية", "البرامج الميدانية"):
+        extra_notes.append(
+            "تنبيه: إجمالي المستفيدين لهذا البرنامج المظلة يشمل مستفيدي الأنشطة والمشاريع الفرعية التابعة له، لذا يجب عدم جمعهم مرتين"
+        )
+
+    ent_type = explicit_type or infer_entity_type_from_name_and_context(
+        name=clean_name,
+        raw_type=None,
+        code=code,
+        is_sub_activity=is_sub,
+        has_children=is_umbrella,
+    )
+
+    if not desc_val:
+        if clean_name == "العلاج الخيري":
+            desc_val = "برنامج لتقديم خدمات العلاج الخيري للمرضى المحتاجين شاملة الأدوية والعمليات الجراحية والكشف المخفض والمستلزمات الطبية."
+            delivery_val = "استقبال طلبات العلاج عبر البوابة الإلكترونية وتوجيه الحالات لمزودي الخدمات الصحية."
+            value_val = "تغطية تكاليف العلاج والعمليات والأدوية للمرضى المحتاجين."
+        elif clean_name == "جهازك حياة":
+            desc_val = "مشروع لاستقبال الأجهزة والمستلزمات الطبية من المتبرعين وصرفها للمرضى المحتاجين والجهات المستفيدة."
+            delivery_val = "استلام الأجهزة الطبية المتبرع بها وفحصها وتوزيعها على المرضى والجهات الصحية."
+            value_val = "توفير الأجهزة والمستلزمات الطبية للمرضى المحتاجين."
+        elif clean_name == "تعزيز الصحة والوقاية":
+            desc_val = "برنامج مظلة لتعزيز الصحة والوقاية ورفع الوعي الصحي للمستفيدين والمجتمع عبر حزمة من الأنشطة والمبادرات التوعوية والميدانية."
+            delivery_val = "تنفيذ أنشطة التثقيف الصحي، قياس العلامات الحيوية، الاستشارات الطبية، والعيادات الافتراضية."
+        elif clean_name == "البرامج الميدانية":
+            desc_val = "برنامج مظلة لتقديم الرعاية الصحية الميدانية عبر الجولات والقوافل الطبية والعيادات المتنقلة والموسمية."
+            delivery_val = "تسيير 30 جولة طبية بين جدة ومكة والطائف و7 قوافل طبية وتشغيل العيادات الميدانية."
+        elif clean_name == "معهد زمزم المعرفي للتدريب":
+            desc_val = "تنفيذ برامج وساعات تدريبية لتطوير القدرات ونقل المعرفة بالتعاون مع الجهات المساهمة."
+            delivery_val = "تقديم 91 برنامجًا تدريبيًا بإجمالي 5,565 ساعة تدريبية."
+
+    desc_val, delivery_val, val_from_desc, targ_from_desc = _split_description_and_delivery(desc_val, delivery_val)
+    if not value_val and val_from_desc:
+        value_val = val_from_desc
+    if not target_val and targ_from_desc:
+        target_val = targ_from_desc
+
+    candidate = {
+        "type": ent_type,
+        "name": clean_name,
+        "year": year,
+        "description": desc_val,
+        "beneficiaries_count": benef_val,
+        "budget": budget_val,
+        "beneficiary_value": value_val,
+        "target_audience": target_val,
+        "delivery_method": delivery_val,
+        "notes": "؛ ".join(extra_notes) if extra_notes else None,
+        "_code": code,
+        "_is_sub_activity": is_sub,
+        "_has_children": is_umbrella,
+    }
+    return validate_entity_schema(candidate, default_year=year)
+
+
+def iter_markdown_report_sections(
     pages: list[tuple[int, str]],
     default_year: int | None = None,
-) -> list[dict[str, Any]]:
-    """Deterministically parse Markdown-structured NGO annual reports and operational plans
-    (where entities are presented under `##` or `###` headings with bulleted attributes
-    like `- عدد المستفيدين:`, `- الوصف:`, `- الميزانية:`, `- إجمالي الإنفاق المالي:`).
-
-    Handles:
-      - Umbrella programs vs. subordinate projects/activities (e.g. `تعزيز الصحة والوقاية`, `البرامج الميدانية`).
-      - Multi-subsection project pages (e.g. `جهازك حياة` with `حركة الإيراد` and `حركة الصرف`).
-      - SROI projects (`مشروع رعاية الحوامل`, etc.) and donation platform projects (`مشروع دعمهم يبصرون`, `مشروع فرحة عاجز`).
-      - Explicit key-value operational plans (e.g. `### البرنامج: جسور المعرفة`, `### المشروع: مهارات الهاتف الذكي`).
-    """
-    # Do not run on Athar-style numbered card decks which are already handled by extract_structured_cards
-    if extract_structured_cards(pages, default_year=default_year):
-        return []
+) -> Iterator[dict[str, Any]]:
+    """Lazily parse and yield Markdown-structured NGO report entities block by block."""
+    if next(iter_structured_cards(pages, default_year=default_year), None) is not None:
+        return
 
     doc_meta = detect_document_metadata(pages)
     year = default_year or doc_meta.get("year")
 
-    # Pass 1: Collect heading blocks across all pages
-    blocks: list[dict[str, Any]] = []
+    # Fast lightweight pass collecting explicit umbrella program links without full block parsing
+    umbrella_names = {"تعزيز الصحة والوقاية", "البرامج الميدانية", "العلاج الخيري", "معهد زمزم المعرفي للتدريب"}
+    for _, body in pages:
+        if body and "يتبع" in body:
+            for m_parent in re.finditer(r"يتبع\s+برنامج\s*[:：]\s*(.+)$", body, re.MULTILINE):
+                umbrella_names.add(m_parent.group(1).strip().rstrip("."))
+
     active_umbrella: str | None = None
 
     for p_no, body in pages:
@@ -1218,7 +1449,6 @@ def extract_markdown_report_sections(
         if not lines:
             continue
 
-        # Check if this page is a multi-subsection single entity page (like `## جهازك حياة` with `### حركة الإيراد` / `### حركة الصرف`)
         h2_headings = [re.sub(r"^##\s+", "", l).strip() for l in lines if l.startswith("## ")]
         h3_headings = [re.sub(r"^###\s+", "", l).strip() for l in lines if l.startswith("### ")]
 
@@ -1228,16 +1458,16 @@ def extract_markdown_report_sections(
             and all(is_non_entity_heading(h3) for h3 in h3_headings)
             and not is_non_entity_heading(h2_headings[0])
         ):
-            # Collapse the entire page under the single H2 entity (e.g. `جهازك حياة`)
-            blocks.append(
-                {
-                    "page": p_no,
-                    "level": 2,
-                    "heading": h2_headings[0],
-                    "parent_umbrella": None,
-                    "lines": [l for l in lines if not l.startswith("## ")],
-                }
-            )
+            block = {
+                "page": p_no,
+                "level": 2,
+                "heading": h2_headings[0],
+                "parent_umbrella": None,
+                "lines": [l for l in lines if not l.startswith("## ")],
+            }
+            parsed = _parse_markdown_report_block(block, year, umbrella_names)
+            if parsed:
+                yield parsed
             continue
 
         page_h2 = h2_headings[0] if h2_headings else None
@@ -1256,266 +1486,43 @@ def extract_markdown_report_sections(
             m = re.match(r"^(#{2,4})\s+(.+)$", l)
             if m:
                 if curr_h is not None:
-                    blocks.append(
-                        {
-                            "page": p_no,
-                            "level": curr_lvl,
-                            "heading": curr_h,
-                            "parent_umbrella": active_umbrella,
-                            "lines": curr_lines,
-                        }
-                    )
+                    block = {
+                        "page": p_no,
+                        "level": curr_lvl,
+                        "heading": curr_h,
+                        "parent_umbrella": active_umbrella,
+                        "lines": curr_lines,
+                    }
+                    parsed = _parse_markdown_report_block(block, year, umbrella_names)
+                    if parsed:
+                        yield parsed
                 curr_lvl = len(m.group(1))
                 curr_h = m.group(2).strip()
                 curr_lines = []
-            else:
-                if curr_h is not None:
-                    curr_lines.append(l)
+            elif curr_h is not None:
+                curr_lines.append(l)
 
         if curr_h is not None:
-            blocks.append(
-                {
-                    "page": p_no,
-                    "level": curr_lvl,
-                    "heading": curr_h,
-                    "parent_umbrella": active_umbrella,
-                    "lines": curr_lines,
-                }
-            )
+            block = {
+                "page": p_no,
+                "level": curr_lvl,
+                "heading": curr_h,
+                "parent_umbrella": active_umbrella,
+                "lines": curr_lines,
+            }
+            parsed = _parse_markdown_report_block(block, year, umbrella_names)
+            if parsed:
+                yield parsed
 
-    # Identify which H2 headings act as umbrella programs over subordinate entities
-    umbrella_names = {"تعزيز الصحة والوقاية", "البرامج الميدانية", "العلاج الخيري", "معهد زمزم المعرفي للتدريب"}
-    for b in blocks:
-        for l in b["lines"]:
-            m_parent = re.search(r"يتبع\s+برنامج\s*[:：]\s*(.+)$", l)
-            if m_parent:
-                umbrella_names.add(m_parent.group(1).strip().rstrip("."))
 
-    extracted: list[dict[str, Any]] = []
-
-    for b in blocks:
-        raw_h = b["heading"]
-        if is_non_entity_heading(raw_h) or "الأنشطة" in raw_h or "(تابع)" in raw_h:
-            continue
-
-        blines = b["lines"]
-        if not blines:
-            continue
-
-        btext = "\n".join(blines).translate(AR_DIGITS)
-
-        # Must contain at least one substantive program/project indicator (beneficiaries, description, budget, SROI, project status, or code)
-        has_evidence = any(
-            k in btext
-            for k in (
-                "عدد المستفيدين",
-                "الوصف:",
-                "وصف البرنامج:",
-                "وصف المشروع:",
-                "إجمالي الإنفاق",
-                "الميزانية:",
-                "إجمالي ميزانية",
-                "القيمة الإجمالية:",
-                "العائد المجتمعي على الاستثمار",
-                "حالة المشروع:",
-                "التصنيف:",
-                "عدد البرامج التدريبية:",
-            )
-        )
-        if not has_evidence:
-            continue
-
-        # Parse explicit attributes from bullet lines
-        explicit_type: str | None = None
-        code: str | None = None
-        desc_val: str | None = None
-        delivery_val: str | None = None
-        target_val: str | None = None
-        benef_val: int | None = None
-        budget_val: int | float | None = None
-        value_val: str | None = None
-        extra_notes: list[str] = [f"المصدر: ص {b['page']}"]
-
-        # Check heading prefix (`البرنامج: ...` / `المشروع: ...`)
-        clean_name = raw_h
-        m_hpref = re.match(r"^(البرنامج|برنامج|المشروع|مشروع)\s*[:：]\s*(.+)$", raw_h)
-        if m_hpref:
-            explicit_type = "program" if "برنامج" in m_hpref.group(1) else "project"
-            clean_name = m_hpref.group(2).strip()
-
-        in_disbursement_section = False
-        for l in blines:
-            l_clean = re.sub(r"^[-*•]\s*", "", l).strip()
-            l_ar = l_clean.translate(AR_DIGITS)
-
-            if "حركة الصرف" in l_ar:
-                in_disbursement_section = True
-                continue
-            if "حركة الإيراد" in l_ar:
-                in_disbursement_section = False
-                continue
-
-            # Explicit type
-            m_type = re.match(r"^التصنيف\s*[:：]\s*(.+)$", l_ar)
-            if m_type:
-                t_str = m_type.group(1).strip()
-                explicit_type = "program" if "برنامج" in t_str else "project"
-                continue
-
-            # Explicit code
-            m_code = re.match(r"^رمز\s+(?:البرنامج|المشروع)\s*[:：]\s*(.+)$", l_ar)
-            if m_code:
-                code = m_code.group(1).strip()
-                extra_notes.append(f"الرمز: {code}")
-                continue
-
-            # Parent program reference
-            m_parent = re.match(r"^يتبع\s+برنامج\s*[:：]\s*(.+)$", l_ar)
-            if m_parent:
-                extra_notes.append(f"البرنامج المظلة: {m_parent.group(1).strip()}")
-                explicit_type = "project"
-                continue
-
-            # Beneficiaries count
-            m_ben = re.search(r"عدد\s+المستفيدين(?:\s+المستهدفين)?\s*[:：]\s*[*_]*([\d,]+)", l_ar)
-            if m_ben:
-                num = to_number(m_ben.group(1))
-                if isinstance(num, int):
-                    benef_val = num
-                continue
-
-            # Budget / Expenditure
-            m_bud = re.search(
-                r"(?:إجمالي\s+الإنفاق(?:\s+المالي)?|إجمالي\s+ميزانية\s+البرنامج|الميزانية)\s*[:：]\s*[*_]*([\d,]+(?:\.\d+)?)",
-                l_ar,
-            )
-            if m_bud:
-                budget_val = to_number(m_bud.group(1))
-                continue
-
-            # In multi-section cards like `جهازك حياة`, prefer `حركة الصرف` value as the expenditure budget, and note revenue in notes
-            m_val = re.search(r"القيمة\s+الإجمالية\s*[:：]\s*[*_]*([\d,]+(?:\.\d+)?)", l_ar)
-            if m_val:
-                v_num = to_number(m_val.group(1))
-                if in_disbursement_section or budget_val is None:
-                    if in_disbursement_section and budget_val is not None:
-                        extra_notes.append(f"قيمة الإيرادات العينية المستلمة: {budget_val:,} ريال")
-                    budget_val = v_num
-                continue
-
-            # Description
-            m_desc = re.match(r"^(?:الوصف|وصف\s+البرنامج|وصف\s+المشروع)\s*[:：]\s*(.+)$", l_clean)
-            if m_desc:
-                desc_val = m_desc.group(1).strip()
-                continue
-
-            # Delivery method
-            m_deliv = re.match(r"^(?:طريقة\s+التنفيذ|آلية\s+التنفيذ)\s*[:：]\s*(.+)$", l_clean)
-            if m_deliv:
-                delivery_val = m_deliv.group(1).strip()
-                continue
-
-            # Target audience
-            m_targ = re.match(r"^(?:الفئة\s+المستهدفة|الفئات\s+المستهدفة)\s*[:：]\s*(.+)$", l_clean)
-            if m_targ:
-                target_val = m_targ.group(1).strip().rstrip(".")
-                continue
-
-            # SROI line
-            if "العائد المجتمعي على الاستثمار" in l_clean:
-                sroi_clean = re.sub(r"\*+", "", l_clean).rstrip(".")
-                desc_val = f"أظهرت دراسة العائد المجتمعي على الاستثمار (SROI) أن {sroi_clean}."
-                value_val = sroi_clean
-                extra_notes.append("ورد ضمن قسم دراسات العائد المجتمعي على الاستثمار (SROI)")
-                continue
-
-            # Government donation platform projects (`مشروع دعمهم يبصرون`, `مشروع فرحة عاجز`)
-            m_stat = re.match(r"^حالة\s+المشروع\s*[:：]\s*(.+)$", l_clean)
-            if m_stat:
-                st = m_stat.group(1).strip().rstrip(".")
-                desc_val = f"مشروع مدرج في منصات التبرع الحكومية (حالة المشروع: {st})."
-                extra_notes.append(f"حالة المشروع في منصات التبرع الحكومية: {st}")
-                continue
-
-            m_unlabeled_num = re.match(r"^الرقم\s+الظاهر\s+بجوار\s+المشروع.*[:：]\s*[*_]*([\d,]+)", l_ar)
-            if m_unlabeled_num:
-                # Do NOT assign an unlabeled platform number to budget or beneficiaries_count; record in notes
-                extra_notes.append(f"الرقم الظاهر بجوار المشروع في التقرير: {m_unlabeled_num.group(1)} (غير محدد كتكلفة أو مستفيدين)")
-                continue
-
-            # Other quantitative facts (e.g. number of rounds, convoys, training programs, devices)
-            if l_clean and not l_clean.startswith("#"):
-                extra_notes.append(re.sub(r"\*+", "", l_clean).rstrip("."))
-
-        # Classify program vs project based on hierarchy and name
-        is_umbrella = clean_name in umbrella_names
-        is_sub = (
-            not is_umbrella
-            and (
-                b["level"] >= 3
-                or (b["parent_umbrella"] in ("تعزيز الصحة والوقاية", "البرامج الميدانية") and b["page"] <= 30)
-            )
-        )
-        if b["parent_umbrella"] and is_sub and f"البرنامج المظلة: {b['parent_umbrella']}" not in extra_notes:
-            extra_notes.insert(1, f"يتبع: {b['parent_umbrella']} (للاسترشاد؛ مستفيدو الأنشطة الفرعية مشمولون ضمن إجمالي البرنامج المظلة لمنع الازدواج)")
-
-        if is_umbrella and clean_name in ("تعزيز الصحة والوقاية", "البرامج الميدانية"):
-            extra_notes.append("تنبيه: إجمالي المستفيدين لهذا البرنامج المظلة يشمل مستفيدي الأنشطة والمشاريع الفرعية التابعة له، لذا يجب عدم جمعهم مرتين")
-
-        ent_type = explicit_type or infer_entity_type_from_name_and_context(
-            name=clean_name,
-            raw_type=None,
-            code=code,
-            is_sub_activity=is_sub,
-            has_children=is_umbrella,
-        )
-
-        # Synthesize description if not explicitly labeled with `الوصف:`
-        if not desc_val:
-            if clean_name == "العلاج الخيري":
-                desc_val = "برنامج لتقديم خدمات العلاج الخيري للمرضى المحتاجين شاملة الأدوية والعمليات الجراحية والكشف المخفض والمستلزمات الطبية."
-                delivery_val = "استقبال طلبات العلاج عبر البوابة الإلكترونية وتوجيه الحالات لمزودي الخدمات الصحية."
-                value_val = "تغطية تكاليف العلاج والعمليات والأدوية للمرضى المحتاجين."
-            elif clean_name == "جهازك حياة":
-                desc_val = "مشروع لاستقبال الأجهزة والمستلزمات الطبية من المتبرعين وصرفها للمرضى المحتاجين والجهات المستفيدة."
-                delivery_val = "استلام الأجهزة الطبية المتبرع بها وفحصها وتوزيعها على المرضى والجهات الصحية."
-                value_val = "توفير الأجهزة والمستلزمات الطبية للمرضى المحتاجين."
-            elif clean_name == "تعزيز الصحة والوقاية":
-                desc_val = "برنامج مظلة لتعزيز الصحة والوقاية ورفع الوعي الصحي للمستفيدين والمجتمع عبر حزمة من الأنشطة والمبادرات التوعوية والميدانية."
-                delivery_val = "تنفيذ أنشطة التثقيف الصحي، قياس العلامات الحيوية، الاستشارات الطبية، والعيادات الافتراضية."
-            elif clean_name == "البرامج الميدانية":
-                desc_val = "برنامج مظلة لتقديم الرعاية الصحية الميدانية عبر الجولات والقوافل الطبية والعيادات المتنقلة والموسمية."
-                delivery_val = "تسيير 30 جولة طبية بين جدة ومكة والطائف و7 قوافل طبية وتشغيل العيادات الميدانية."
-            elif clean_name == "معهد زمزم المعرفي للتدريب":
-                desc_val = "تنفيذ برامج وساعات تدريبية لتطوير القدرات ونقل المعرفة بالتعاون مع الجهات المساهمة."
-                delivery_val = "تقديم 91 برنامجًا تدريبيًا بإجمالي 5,565 ساعة تدريبية."
-
-        desc_val, delivery_val, val_from_desc, targ_from_desc = _split_description_and_delivery(desc_val, delivery_val)
-        if not value_val and val_from_desc:
-            value_val = val_from_desc
-        if not target_val and targ_from_desc:
-            target_val = targ_from_desc
-
-        candidate = {
-            "type": ent_type,
-            "name": clean_name,
-            "year": year,
-            "description": desc_val,
-            "beneficiaries_count": benef_val,
-            "budget": budget_val,
-            "beneficiary_value": value_val,
-            "target_audience": target_val,
-            "delivery_method": delivery_val,
-            "notes": "؛ ".join(extra_notes) if extra_notes else None,
-            "_code": code,
-            "_is_sub_activity": is_sub,
-            "_has_children": is_umbrella,
-        }
-        validated = validate_entity_schema(candidate, default_year=year)
-        if validated:
-            extracted.append(validated)
-
-    return extracted
+def extract_markdown_report_sections(
+    pages: list[tuple[int, str]],
+    default_year: int | None = None,
+) -> list[dict[str, Any]]:
+    """Deterministically parse Markdown-structured NGO annual reports and operational plans
+    (where entities are presented under `##` or `###` headings with bulleted attributes).
+    """
+    return list(iter_markdown_report_sections(pages, default_year=default_year))
 
 
 def _collect_verbatim_document_headings(pages: list[tuple[int, str]]) -> list[str]:
@@ -1528,7 +1535,12 @@ def _collect_verbatim_document_headings(pages: list[tuple[int, str]]) -> list[st
             s = line.strip()
             m = re.match(r"^#{1,4}\s+(.+)$", s)
             if m:
-                h = re.sub(r"^(?:البرنامج|برنامج|المشروع|مشروع)\s*[:：]\s*", "", m.group(1).strip()).strip()
+                h = re.sub(
+                    r"^(?:البرنامج|برنامج|المشروع|مشروع|program|programme|project)\s*[:：]\s*",
+                    "",
+                    m.group(1).strip(),
+                    flags=re.IGNORECASE,
+                ).strip()
                 if h and not is_non_entity_heading(h) and h not in headings:
                     headings.append(h)
     return headings
@@ -1570,6 +1582,130 @@ def snap_name_to_document_heading(name: str, verbatim_headings: list[str]) -> tu
     return name, False
 
 
+def find_matching_entity(
+    candidate: dict[str, Any],
+    existing_items: list[dict[str, Any]],
+    threshold: float = 0.92,
+) -> dict[str, Any] | None:
+    """Return an already-collected compatible duplicate entity if one exists, else None."""
+    for existing in existing_items:
+        if (
+            existing["type"] == candidate["type"]
+            and name_score(existing["name"], candidate["name"]) >= threshold
+            and _compatible(existing, candidate)
+        ):
+            return existing
+    return None
+
+
+def reconcile_single_entity(
+    item: dict[str, Any],
+    *,
+    verbatim_headings: list[str],
+    reference_entities: list[dict[str, Any]],
+    full_doc_text: str,
+    full_doc_norm: str,
+    default_year: int | None = None,
+    review: list[dict[str, str]] | None = None,
+    used_ref_indices: set[int] | None = None,
+) -> dict[str, Any] | None:
+    """Snap name, enforce 10-field schema, ground numeric fields, and enrich one entity."""
+    if not isinstance(item, dict):
+        return None
+    if review is None:
+        review = []
+
+    raw_name = str(item.get("name") or "").strip()
+    snapped_name, was_snapped = snap_name_to_document_heading(raw_name, verbatim_headings)
+    if was_snapped:
+        review.append({"name": snapped_name, "reason": f"تم تصحيح الاسم من '{raw_name}' لمطابقة النص الأصلي"})
+        item = dict(item, name=snapped_name)
+
+    validated = validate_entity_schema(item, default_year=default_year)
+    if not validated:
+        return None
+
+    for num_field in ("beneficiaries_count", "budget"):
+        if validated[num_field] is not None and not number_in_text(validated[num_field], full_doc_norm):
+            review.append({"name": validated["name"], "reason": f"{num_field} غير مكتوب في النص - اتحوّل null"})
+            validated[num_field] = None
+
+    if validated["beneficiaries_count"] is not None and is_kpi_quantity_not_beneficiaries(
+        validated["beneficiaries_count"],
+        full_doc_text,
+        entity_name=validated["name"],
+    ):
+        review.append(
+            {
+                "name": validated["name"],
+                "reason": f"الرقم {validated['beneficiaries_count']} مؤشر أداء/كمية مستهدفة وليس عدد المستفيدين - اتحوّل null",
+            }
+        )
+        validated["beneficiaries_count"] = None
+
+    matched_idx = None
+    for idx, ref_ent in enumerate(reference_entities):
+        if name_score(validated["name"], ref_ent["name"]) >= 0.85:
+            matched_idx = idx
+            break
+
+    if matched_idx is not None:
+        if used_ref_indices is not None:
+            used_ref_indices.add(matched_idx)
+        ref_ent = reference_entities[matched_idx]
+        if validated["type"] != ref_ent["type"]:
+            review.append(
+                {
+                    "name": ref_ent["name"],
+                    "reason": f"تم تصحيح التصنيف من {validated['type']} إلى {ref_ent['type']} وفق هيكل المستند",
+                }
+            )
+        validated["type"] = ref_ent["type"]
+        validated["name"] = ref_ent["name"]
+        for num_k in ("budget", "beneficiaries_count"):
+            if ref_ent.get(num_k) is not None:
+                validated[num_k] = ref_ent[num_k]
+        for str_k in ("year", "description", "beneficiary_value", "target_audience", "delivery_method", "notes"):
+            if ref_ent.get(str_k) not in (None, ""):
+                validated[str_k] = ref_ent[str_k]
+    else:
+        desc, deliv, val_ext, targ_ext = _split_description_and_delivery(
+            validated.get("description"),
+            validated.get("delivery_method"),
+        )
+        validated["description"] = desc
+        validated["delivery_method"] = deliv
+        if not validated.get("beneficiary_value") and val_ext:
+            validated["beneficiary_value"] = val_ext
+        if not validated.get("target_audience") and targ_ext:
+            validated["target_audience"] = targ_ext
+
+    return validated
+
+
+def compute_needs_attention(
+    review_list: list[dict[str, str]],
+    *,
+    all_items: list[dict[str, Any]],
+    json_repaired: bool = False,
+    needs_attention: bool = False,
+    failed_items_count: int = 0,
+) -> bool:
+    """Compute whether extraction output requires human or downstream review."""
+    return bool(
+        needs_attention
+        or json_repaired
+        or failed_items_count > 0
+        or not all_items
+        or any(
+            "اتحوّل null" in r.get("reason", "")
+            or "إغفاله" in r.get("reason", "")
+            or "تصحيح" in r.get("reason", "")
+            for r in review_list
+        )
+    )
+
+
 def enrich_and_reconcile_entities(
     model_entities: list[dict[str, Any]],
     pages: list[tuple[int, str]],
@@ -1598,76 +1734,18 @@ def enrich_and_reconcile_entities(
     used_ref_indices: set[int] = set()
 
     for item in model_entities:
-        if not isinstance(item, dict):
-            continue
-        raw_name = str(item.get("name") or "").strip()
-        snapped_name, was_snapped = snap_name_to_document_heading(raw_name, verbatim_headings)
-        if was_snapped:
-            review.append({"name": snapped_name, "reason": f"تم تصحيح الاسم من '{raw_name}' لمطابقة النص الأصلي"})
-            item = dict(item, name=snapped_name)
-
-        validated = validate_entity_schema(item, default_year=default_year)
-        if not validated:
-            continue
-
-        # Ground numbers against full document
-        for num_field in ("beneficiaries_count", "budget"):
-            if validated[num_field] is not None and not number_in_text(validated[num_field], full_doc_norm):
-                review.append({"name": validated["name"], "reason": f"{num_field} غير مكتوب في النص - اتحوّل null"})
-                validated[num_field] = None
-
-        if validated["beneficiaries_count"] is not None and is_kpi_quantity_not_beneficiaries(
-            validated["beneficiaries_count"],
-            full_doc_text,
-            entity_name=validated["name"],
-        ):
-            review.append(
-                {
-                    "name": validated["name"],
-                    "reason": f"الرقم {validated['beneficiaries_count']} مؤشر أداء/كمية مستهدفة وليس عدد المستفيدين - اتحوّل null",
-                }
-            )
-            validated["beneficiaries_count"] = None
-
-        # Match against deterministic reference entity (structural card or markdown section)
-        matched_idx = None
-        for idx, ref_ent in enumerate(reference_entities):
-            if name_score(validated["name"], ref_ent["name"]) >= 0.85:
-                matched_idx = idx
-                break
-
-        if matched_idx is not None:
-            used_ref_indices.add(matched_idx)
-            ref_ent = reference_entities[matched_idx]
-            if validated["type"] != ref_ent["type"]:
-                review.append(
-                    {
-                        "name": ref_ent["name"],
-                        "reason": f"تم تصحيح التصنيف من {validated['type']} إلى {ref_ent['type']} وفق هيكل المستند",
-                    }
-                )
-            validated["type"] = ref_ent["type"]
-            validated["name"] = ref_ent["name"]
-            for num_k in ("budget", "beneficiaries_count"):
-                if ref_ent.get(num_k) is not None:
-                    validated[num_k] = ref_ent[num_k]
-            for str_k in ("year", "description", "beneficiary_value", "target_audience", "delivery_method", "notes"):
-                if ref_ent.get(str_k) not in (None, ""):
-                    validated[str_k] = ref_ent[str_k]
-        else:
-            # For free-form narrative entities without a deterministic card/section, avoid duplicating delivery_method == description
-            desc, deliv, val_ext, targ_ext = _split_description_and_delivery(
-                validated.get("description"),
-                validated.get("delivery_method"),
-            )
-            validated["description"] = desc
-            validated["delivery_method"] = deliv
-            if not validated.get("beneficiary_value") and val_ext:
-                validated["beneficiary_value"] = val_ext
-            if not validated.get("target_audience") and targ_ext:
-                validated["target_audience"] = targ_ext
-
-        reconciled.append(validated)
+        validated = reconcile_single_entity(
+            item,
+            verbatim_headings=verbatim_headings,
+            reference_entities=reference_entities,
+            full_doc_text=full_doc_text,
+            full_doc_norm=full_doc_norm,
+            default_year=default_year,
+            review=review,
+            used_ref_indices=used_ref_indices,
+        )
+        if validated:
+            reconciled.append(validated)
 
     # Add any deterministic card or markdown section that the model missed
     for idx, ref_ent in enumerate(reference_entities):
@@ -1684,19 +1762,12 @@ def enrich_and_reconcile_entities(
     # Final deduplication pass preserving order
     deduped: list[dict[str, Any]] = []
     for ent in reconciled:
-        duplicate_found = False
-        for existing in deduped:
-            if (
-                existing["type"] == ent["type"]
-                and name_score(existing["name"], ent["name"]) >= 0.92
-                and _compatible(existing, ent)
-            ):
-                for k in FIELDS:
-                    if existing.get(k) in (None, "") and ent.get(k) not in (None, ""):
-                        existing[k] = ent[k]
-                duplicate_found = True
-                break
-        if not duplicate_found:
+        existing = find_matching_entity(ent, deduped)
+        if existing is not None:
+            for k in FIELDS:
+                if existing.get(k) in (None, "") and ent.get(k) not in (None, ""):
+                    existing[k] = ent[k]
+        else:
             deduped.append(ent)
 
     return deduped
@@ -1730,16 +1801,11 @@ def build_contract_response(
 
     # Flag needs_attention if any chunk had parse/truncation errors, JSON required repair,
     # no entities were extracted, or review flags indicate corrections/missing data.
-    attention_flag = bool(
-        needs_attention
-        or json_repaired
-        or not all_items
-        or any(
-            "اتحوّل null" in r.get("reason", "")
-            or "إغفاله" in r.get("reason", "")
-            or "تصحيح" in r.get("reason", "")
-            for r in review_list
-        )
+    attention_flag = compute_needs_attention(
+        review_list,
+        all_items=all_items,
+        json_repaired=json_repaired,
+        needs_attention=needs_attention,
     )
 
     primary: dict[str, Any] = (
