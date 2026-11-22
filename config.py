@@ -1,24 +1,56 @@
+"""
+config.py - Runtime configuration for Athar NGO Program & Project Extraction.
+
+All parameters can be overridden via environment variables on the RunPod endpoint
+without rebuilding the Docker image. No secrets are stored in this file.
+"""
+
 import os
 
 MODEL_ID = os.getenv("MODEL_ID", "mistralai/Mistral-Small-24B-Instruct-2501")
-# الـLoRA بيتحمّل وقت التشغيل من Hugging Face (ريبو خاص): env variables في الـendpoint
-#   LORA_REPO = USERNAME/REPO     HF_TOKEN = توكن read-only
-#   LORA_PATH = (اختياري) مسار محلي للاختبار بس
+
+# Fine-tuned LoRA adapter downloaded at startup from Hugging Face (private or public repo):
+#   LORA_REPO = USERNAME/REPO
+#   HF_TOKEN  = read-only Hugging Face token (configured in RunPod Secrets)
+#   LORA_PATH = optional local path override for offline testing
 LORA_REPO = os.getenv("LORA_REPO", "YOUR-HF-USERNAME/nonprofit-lora")
 LORA_PATH = os.getenv("LORA_PATH", "")
 
-# نفس إعدادات التقسيم اللي اتدرّب عليها الموديل (prepare_chunks.py): لا تغيّرها.
+# Cache directories (checks RunPod Network Volume, RunPod Cached Models, and local HF cache)
+HF_CACHE_ROOT = os.getenv("HF_CACHE_ROOT", "/runpod-volume/huggingface-cache/hub")
+LORA_CACHE_DIR = os.getenv("LORA_CACHE_DIR", "/runpod-volume/lora-cache")
+
+# Training-aligned chunking parameters (prepare_chunks.py defaults)
 CHUNK_TARGET_CHARS = int(os.getenv("CHUNK_TARGET_CHARS", "10000"))
 CHUNK_OVERLAP_PAGES = int(os.getenv("CHUNK_OVERLAP_PAGES", "1"))
 
-# توليد: greedy، نفس تقييم التدريب (6144 توكن جديد للجزء الواحد)
+# Generation & context budget settings
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "6144"))
-MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "12000"))   # حماية: الجزء العادي ~4-5 آلاف توكن
+MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "12000"))
 DO_SAMPLE = False
 REPETITION_PENALTY = float(os.getenv("REPETITION_PENALTY", "1.0"))
 MERGE_NAME_THRESHOLD = float(os.getenv("MERGE_NAME_THRESHOLD", "0.9"))
 
-# لازم يتطابق حرفيًا مع SYSTEM_PROMPT في train_v3.py. (لو الـadapter فيه system_prompt.txt بيتاخد هو بدل ده تلقائيًا.)
+# Bounded retry and timeout policies
+MAX_CHUNK_RETRIES = int(os.getenv("MAX_CHUNK_RETRIES", "1"))
+EXECUTION_TIMEOUT_SECONDS = int(os.getenv("EXECUTION_TIMEOUT_SECONDS", "540"))
+INIT_TIMEOUT_SECONDS = int(os.getenv("INIT_TIMEOUT_SECONDS", "600"))
+ENABLE_OCR = os.getenv("ENABLE_OCR", "1").strip().lower() not in ("0", "false", "no")
+
+# Hybrid optimization: skip redundant GPU inference on pages whose structured cards
+# were already deterministically extracted with 100% field grounding.
+SKIP_LLM_FOR_STRUCTURED_CARD_PAGES = (
+    os.getenv("SKIP_LLM_FOR_STRUCTURED_CARD_PAGES", "1").strip().lower() not in ("0", "false", "no")
+)
+
+# Progressive streaming settings (RunPod Serverless generator handler)
+STREAM_SCHEMA_VERSION = "1.0"
+RUNPOD_ENABLE_STREAMING = os.getenv("RUNPOD_ENABLE_STREAMING", "1").strip().lower() not in ("0", "false", "no")
+RETURN_AGGREGATE_STREAM = os.getenv("RETURN_AGGREGATE_STREAM", "1").strip().lower() not in ("0", "false", "no")
+STREAM_EMIT_PROGRESS = os.getenv("STREAM_EMIT_PROGRESS", "1").strip().lower() not in ("0", "false", "no")
+STREAM_DEADLINE_BUFFER_SECONDS = int(os.getenv("STREAM_DEADLINE_BUFFER_SECONDS", "15"))
+
+# Must match SYSTEM_PROMPT in train_v3.py (overridden automatically if adapter contains system_prompt.txt)
 SYSTEM_PROMPT = (
     "أنت نموذج متخصص في استخراج البرامج والمشاريع والمبادرات والفعاليات الرئيسية من التقارير السنوية "
     "للجمعيات غير الربحية. اقرأ النص كما هو (قد يحتوي على أخطاء OCR بسيطة وصفحات غير مكتملة)، "
